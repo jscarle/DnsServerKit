@@ -65,18 +65,18 @@ public sealed record DnsRequest
     /// <summary>Gets the questions of the DNS request.</summary>
     public List<DnsQuestion> Questions { get; }
 
-    private DnsRequest(ushort id, bool qr, OpCode opCode, bool aa, bool tc, bool rd, bool ra, byte z, RCode rCode,
+    private DnsRequest(ushort id, bool qr, byte opCode, bool aa, bool tc, bool rd, bool ra, byte z, byte rCode,
         ushort qdCount, ushort anCount, ushort nsCount, ushort arCount, List<DnsQuestion> questions)
     {
         ID = id;
         QR = qr;
-        OpCode = opCode;
+        OpCode = (OpCode)opCode;
         AA = aa;
         TC = tc;
         RD = rd;
         RA = ra;
         Z = z;
-        RCode = rCode;
+        RCode = (RCode)rCode;
         QDCount = qdCount;
         ANCount = anCount;
         NSCount = nsCount;
@@ -98,20 +98,28 @@ public sealed record DnsRequest
         {
             var span = memory.Span;
 
+            // Parse header
             var id = (ushort)((span[0] << 8) | span[1]);
             var qr = (span[2] & 0x80) != 0;
-            var opCode = (OpCode)((span[2] & 0x78) >> 3);
+            var opCode = (byte)((span[2] & 0x78) >> 3);
             var aa = (span[2] & 0x04) != 0;
             var tc = (span[2] & 0x02) != 0;
             var rd = (span[2] & 0x01) != 0;
             var ra = (span[3] & 0x80) != 0;
             var z = (byte)((span[3] & 0x70) >> 4);
-            var rCode = (RCode)(span[3] & 0x0F);
+            var rCode = (byte)(span[3] & 0x0F);
             var qdCount = (ushort)((span[4] << 8) | span[5]);
             var anCount = (ushort)((span[6] << 8) | span[7]);
             var nsCount = (ushort)((span[8] << 8) | span[9]);
             var arCount = (ushort)((span[10] << 8) | span[11]);
 
+            if (!Enum.IsDefined(typeof(OpCode), opCode))
+                Result.Fail<DnsRequest>("Could not process the request. Invalid OpCode.");
+            if (!Enum.IsDefined(typeof(RCode), rCode))
+                Result.Fail<DnsRequest>("Could not process the request. Invalid RCode.");
+            if (qdCount == 0)
+                Result.Fail<DnsRequest>("Could not process the request. QDCount is 0.");
+            
             var questions = new List<DnsQuestion>(qdCount);
             var offset = 12;
             for (var i = 0; i < qdCount; i++)
@@ -124,9 +132,15 @@ public sealed record DnsRequest
 
                 var type = (ushort)((span[offset] << 8) | span[offset + 1]);
                 var @class = (ushort)((span[offset + 2] << 8) | span[offset + 3]);
-                offset += 4;
 
-                questions.Add(new DnsQuestion(name, type, @class));
+                if (!Enum.IsDefined(typeof(RRType), type))
+                    Result.Fail<DnsRequest>("Could not process the request. Invalid Class.");
+                if (!Enum.IsDefined(typeof(DnsClass), @class))
+                    Result.Fail<DnsRequest>("Could not process the request. Invalid Class.");
+
+                questions.Add(new DnsQuestion(name, (RRType)type, (DnsClass)@class));
+
+                offset += 4;
             }
 
             return new DnsRequest(id, qr, opCode, aa, tc, rd, ra, z, rCode, qdCount, anCount, nsCount, arCount, questions);

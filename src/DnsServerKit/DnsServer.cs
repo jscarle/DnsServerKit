@@ -78,6 +78,8 @@ public sealed class DnsServer : IHostedService, IAsyncDisposable
                     {
                         _logger.LogError("{Error}", error.Message);
                     }
+                    
+                    
 
                     // Echo back for now.
                     await _udpSocket!.SendToAsync(memory, SocketFlags.None, result.RemoteEndPoint, cancellationToken);
