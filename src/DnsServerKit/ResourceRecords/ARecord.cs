@@ -1,56 +1,61 @@
-﻿using System.Net;
+﻿using System.Buffers.Binary;
+using System.Net;
+using DnsServerKit.Parameters;
 
 namespace DnsServerKit.ResourceRecords;
 
-public sealed class ARecord : ResourceRecord
+public sealed record ARecord : IResourceRecord
 {
-    public string Name { get; }
-    public RRType Type { get; }
-    public DnsClass Class { get; }
-    public int TTL { get; }
-    public IPAddress IpAddress { get; }
+    /// <inheritdoc/>
+    public required string Name { get; init; }
+    
+    /// <inheritdoc/>
+    public RecordType Type => RecordType.A;
+    
+    /// <inheritdoc/>
+    public DnsClass Class => DnsClass.Internet;
+    
+    /// <inheritdoc/>
+    public int Ttl { get; init; }
 
-    public ARecord(string name, RRType type, DnsClass @class, int ttl, IPAddress ipAddress)
+    /// <summary>
+    /// Gets the IP address for the resource record.
+    /// </summary>
+    public required IPAddress IpAddress { get; init; }
+    
+    /// <inheritdoc/>
+    public ReadOnlyMemory<byte> ResourceData
     {
-        Name = name;
-        Type = type;
-        Class = @class;
-        TTL = ttl;
-        IpAddress = ipAddress;
-    }
+        get
+        {
+            // Encode the DNS name
+            var nameBytes = NameHelper.EncodeDnsName(Name);
 
-    public override ReadOnlyMemory<byte> ToBytes()
-    {
-        var dnsName = DnsEncodeName(Name);
-        var type = BitConverter.GetBytes((ushort)Type);
-        var @class = BitConverter.GetBytes((ushort)Class);
-        var ttl = BitConverter.GetBytes(TTL);
-        var size = BitConverter.GetBytes(4);
-        var ipAddress = IpAddress.GetAddressBytes();
+            // Encode the IP address
+            var ipAddressBytes = IpAddress.GetAddressBytes();
 
-        var length = dnsName.Length + type.Length + @class.Length + ttl.Length + size.Length + ipAddress.Length;
+            // Create the resource record data array with space for the name, type, class, ttl, and data
+            var rrData = new byte[nameBytes.Length + ipAddressBytes.Length + 10]; // 10 bytes for type, class, ttl, data length
 
-        var bytes = new byte[length];
+            // Copy the encoded name into the resource record data array
+            Buffer.BlockCopy(nameBytes, 0, rrData, 0, nameBytes.Length);
 
-        var offset = 0;
-        
-        Buffer.BlockCopy(dnsName, 0, bytes, offset, dnsName.Length);
-        offset += dnsName.Length;
+            // Encode Type
+            BinaryPrimitives.WriteUInt16BigEndian(rrData.AsSpan(nameBytes.Length, 2), (ushort)Type);
 
-        Buffer.BlockCopy(type, 0, bytes, offset, type.Length);
-        offset += type.Length;
+            // Encode Class
+            BinaryPrimitives.WriteUInt16BigEndian(rrData.AsSpan(nameBytes.Length + 2, 2), (ushort)Class);
 
-        Buffer.BlockCopy(@class, 0, bytes, offset, @class.Length);
-        offset += @class.Length;
+            // Encode TTL (Time to Live)
+            BinaryPrimitives.WriteInt32BigEndian(rrData.AsSpan(nameBytes.Length + 4, 4), Ttl);
 
-        Buffer.BlockCopy(ttl, 0, bytes, offset, ttl.Length);
-        offset += ttl.Length;
+            // Encode data length
+            BinaryPrimitives.WriteUInt16BigEndian(rrData.AsSpan(nameBytes.Length + 8, 2), (ushort)ipAddressBytes.Length);
 
-        Buffer.BlockCopy(size, 0, bytes, offset, size.Length);
-        offset += size.Length;
+            // Copy the encoded IP address into the resource record data array
+            Buffer.BlockCopy(ipAddressBytes, 0, rrData, nameBytes.Length + 10, ipAddressBytes.Length);
 
-        Buffer.BlockCopy(ipAddress, 0, bytes, offset, ipAddress.Length);
-
-        return new ReadOnlyMemory<byte>(bytes);
+            return new ReadOnlyMemory<byte>(rrData);
+        }
     }
 }

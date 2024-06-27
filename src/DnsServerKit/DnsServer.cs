@@ -1,6 +1,12 @@
 ﻿using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
+using System.Text;
+using DnsServerKit.Parameters;
+using DnsServerKit.Queries;
+using DnsServerKit.ResourceRecords;
+using DnsServerKit.Responses;
+using LightResults;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 
@@ -8,38 +14,24 @@ namespace DnsServerKit;
 
 public sealed class DnsServer : IHostedService, IAsyncDisposable
 {
-    private readonly byte[] _buffer = new byte[512];
-    private readonly IPEndPoint _localEndpoint = new(IPAddress.Any, 53);
     private readonly ILogger<DnsServer> _logger;
     private CancellationTokenSource? _cts;
-    private Task? _listeningTask;
     private Socket? _udpSocket;
+    private Task? _listeningTask;
 
     public DnsServer(ILogger<DnsServer> logger)
     {
         _logger = logger;
     }
 
-    public async ValueTask DisposeAsync()
-    {
-        if (_udpSocket != null)
-        {
-            _udpSocket.Close();
-            _udpSocket.Dispose();
-        }
-
-        _cts?.Dispose();
-
-        if (_listeningTask != null)
-            await _listeningTask;
-    }
-
     public Task StartAsync(CancellationToken cancellationToken)
     {
-        _udpSocket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
-        _udpSocket.Bind(_localEndpoint);
         _cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
 
+        _udpSocket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+        var localEndpoint = new IPEndPoint(IPAddress.Any, 53);
+        _udpSocket.Bind(localEndpoint);
+        
         _listeningTask = ListenForQueriesAsync(_cts.Token);
 
         return Task.CompletedTask;
@@ -48,7 +40,22 @@ public sealed class DnsServer : IHostedService, IAsyncDisposable
     public Task StopAsync(CancellationToken cancellationToken)
     {
         _cts?.Cancel();
+        
         return _listeningTask ?? Task.CompletedTask;
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        if (_listeningTask != null)
+            await _listeningTask;
+
+        if (_udpSocket != null)
+        {
+            _udpSocket.Close();
+            _udpSocket.Dispose();
+        }
+
+        _cts?.Dispose();
     }
 
     private async Task ListenForQueriesAsync(CancellationToken cancellationToken)
@@ -57,46 +64,73 @@ public sealed class DnsServer : IHostedService, IAsyncDisposable
 
         _logger.LogInformation("Starting to listen...");
 
-        try
-        {
-            var memory = _buffer.AsMemory();
-            var remoteEndpoint = new IPEndPoint(IPAddress.Any, 0);
+        var remoteEndpoint = new IPEndPoint(IPAddress.Any, 0);
+        var buffer = new byte[512];
+        var memory = buffer.AsMemory();
 
-            while (!cancellationToken.IsCancellationRequested)
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            try
             {
-                try
-                {
-                    var result = await _udpSocket.ReceiveFromAsync(memory, SocketFlags.None, remoteEndpoint, cancellationToken);
+                var result = await _udpSocket.ReceiveFromAsync(memory, SocketFlags.None, remoteEndpoint, cancellationToken);
 
-                    if (DnsRequest.TryCreate(memory).IsSuccess(out var dnsRequest, out var error))
-                    {
-                        _logger.LogInformation("{ReceivedBytes} bytes received.\r\n{Request}", result.ReceivedBytes, dnsRequest);
-                        foreach(var question in dnsRequest.Questions)
-                            _logger.LogInformation(" - {Question}", question);
-                    }
-                    else
-                    {
-                        _logger.LogError("{Error}", error.Message);
-                    }
-                    
-                    
+                if (DnsQuery.TryParse(memory).IsFailed(out var error, out var dnsQuery))
+                {
+                    _logger.LogError("{Error}", error.Message);
+                    continue;
+                }
 
-                    // Echo back for now.
-                    await _udpSocket!.SendToAsync(memory, SocketFlags.None, result.RemoteEndPoint, cancellationToken);
-                }
-                catch (OperationCanceledException)
+                var log = new StringBuilder();
+                log.AppendLine($"{result.ReceivedBytes} bytes received.");
+                log.AppendLine($"{dnsQuery}");
+                foreach(var question in dnsQuery.Questions)
+                    log.AppendLine($" - {question}");
+                _logger.LogInformation("{Message}", log.ToString());
+
+                var aRecord = new ARecord
                 {
-                    break;
-                }
-                catch (Exception ex)
+                    Name = "google.ca",
+                    IpAddress = IPAddress.Parse("8.8.8.8"),
+                };
+
+                var answers = new List<IResourceRecord>
                 {
-                    Console.WriteLine($"Exception occurred while receiving data: {ex}");
+                    aRecord,
+                };
+
+                var dnsResponse = new DnsResponse(dnsQuery, true, false, answers);
+
+                var data = new List<ReadOnlyMemory<byte>>
+                {
+                    dnsResponse.HeaderData,
+                };
+                foreach (var question in dnsResponse.Questions)
+                    data.Add(question.QuestionData);
+                foreach (var answer in dnsResponse.Answers)
+                    data.Add(answer.ResourceData);
+
+                var length = data.Sum(x => x.Length);
+                var bytes = new byte[length];
+                var offset = 0;
+                foreach (var readOnlyMemory in data)
+                {
+                    var arr = readOnlyMemory.ToArray();
+                    Buffer.BlockCopy(arr, 0, bytes, offset, arr.Length);
+                    offset += arr.Length;
                 }
+                var outMemory = new ReadOnlyMemory<byte>(bytes);
+
+                // Echo back for now.
+                await _udpSocket!.SendToAsync(outMemory, SocketFlags.None, result.RemoteEndPoint, cancellationToken);
             }
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine(ex);
+            catch (OperationCanceledException)
+            {
+                break;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Exception occurred while receiving data: {ex}");
+            }
         }
     }
 }
