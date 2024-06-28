@@ -3,12 +3,10 @@ using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
-using System.Xml;
 using DnsServerKit.Parameters;
 using DnsServerKit.Queries;
 using DnsServerKit.ResourceRecords;
 using DnsServerKit.Responses;
-using LightResults;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 
@@ -73,6 +71,8 @@ public sealed class DnsServer : IHostedService, IAsyncDisposable
 
         while (!cancellationToken.IsCancellationRequested)
         {
+            try
+            {
                 var receiveResult = await _udpSocket.ReceiveFromAsync(receiveBuffer, SocketFlags.None, remoteEndpoint, cancellationToken);
                 if (DnsReader.TryReadBytes(receiveBuffer).IsFailed(out var error, out var dnsQuery))
                 {
@@ -80,14 +80,15 @@ public sealed class DnsServer : IHostedService, IAsyncDisposable
                     continue;
                 }
                 
-                LogQuery(receiveResult.ReceivedBytes, dnsQuery);
+                //LogQuery(receiveResult.ReceivedBytes, dnsQuery);
+                
                 var dnsResponse = CreateDnsResponse(dnsQuery);
+                
 
-                var sendBuffer = DnsWriter.GetBytes(dnsResponse);
+                using var dnsWriter = new DnsWriter(dnsResponse);
+                var sendBuffer = dnsWriter.GetBytes();
                 var sentBytes = await _udpSocket.SendToAsync(sendBuffer, SocketFlags.None, receiveResult.RemoteEndPoint, cancellationToken);
-                LogResponse(sentBytes, dnsResponse);
-            try
-            {
+                //LogResponse(sentBytes, dnsResponse);
             }
             catch (OperationCanceledException)
             {
@@ -102,17 +103,33 @@ public sealed class DnsServer : IHostedService, IAsyncDisposable
 
     private static DnsResponse CreateDnsResponse(DnsQuery dnsQuery)
     {
-        var aRecord = new ARecord
+        var answers = new List<IResourceRecord>();
+
+        foreach (var question in dnsQuery.Questions)
         {
-            Name = "google.ca",
-            IpAddress = IPAddress.Parse("8.8.8.8"),
-        };
-        var answers = new List<IResourceRecord>
+            if (question is { Class: DnsClass.Internet, Type: RecordType.A })
+            {
+                answers.Add(new ARecord
+                {
+                    Name = question.Name,
+                    IpAddress = IPAddress.Parse("151.101.2.217"),
+                });
+            }
+            if (question is { Class: DnsClass.Internet, Type: RecordType.Ptr })
+            {
+                answers.Add(new PtrRecord
+                {
+                    Name = "localhost",
+                });
+            }
+        }
+
+        if (answers.Count == 0)
         {
-            aRecord,
-        };
-        var dnsResponse = new DnsResponse(dnsQuery, true, false, answers);
-        return dnsResponse;
+            return new DnsResponse(dnsQuery, false, true, ResponseCode.NotZone);
+        }
+        
+        return new DnsResponse(dnsQuery, false, true, answers);
     }
 
     private void LogQuery(int receivedBytes, DnsQuery dnsQuery)

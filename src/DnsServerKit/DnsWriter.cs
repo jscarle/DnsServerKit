@@ -1,125 +1,193 @@
-﻿using System.Buffers.Binary;
+﻿using System.Buffers;
+using System.Buffers.Binary;
 using System.Text;
+using DnsServerKit.Queries;
 using DnsServerKit.ResourceRecords;
 using DnsServerKit.Responses;
+using JetBrains.Annotations;
 
 namespace DnsServerKit;
 
-public sealed class DnsWriter
+[MustDisposeResource]
+public sealed class DnsWriter : IDisposable
 {
-    public static ReadOnlyMemory<byte> GetBytes(DnsResponse dnsResponse)
+    private readonly DnsResponse _dnsResponse;
+    private readonly Dictionary<string, int> _namePositions = new();
+    private byte[] _bytes;
+
+    public DnsWriter(DnsResponse dnsResponse)
     {
-        var memoryStream = new MemoryStream();
-        var namePositions = new Dictionary<string, int>();
-
-        var headerBytes = new byte[12];
-
-        // Transaction ID
-        BinaryPrimitives.WriteUInt16BigEndian(headerBytes.AsSpan(0, 2), dnsResponse.ID);
-
-        // Flags
-        var flags = (ushort)(
-            (dnsResponse.QR ? 0x8000 : 0) |
-            ((ushort)dnsResponse.OpCode << 11) |
-            (dnsResponse.AA ? 0x0400 : 0) |
-            (dnsResponse.TC ? 0x0200 : 0) |
-            (dnsResponse.RD ? 0x0100 : 0) |
-            (dnsResponse.RA ? 0x0080 : 0) |
-            (dnsResponse.Z << 4) |
-            (ushort)dnsResponse.RCode
-        );
-        BinaryPrimitives.WriteUInt16BigEndian(headerBytes.AsSpan(2, 2), flags);
-
-        // Question Count
-        BinaryPrimitives.WriteUInt16BigEndian(headerBytes.AsSpan(4, 2), dnsResponse.QDCount);
-
-        // Answer Record Count
-        BinaryPrimitives.WriteUInt16BigEndian(headerBytes.AsSpan(6, 2), dnsResponse.ANCount);
-
-        // Authority Record Count
-        BinaryPrimitives.WriteUInt16BigEndian(headerBytes.AsSpan(8, 2), dnsResponse.NSCount);
-
-        // Additional Record Count
-        BinaryPrimitives.WriteUInt16BigEndian(headerBytes.AsSpan(10, 2), dnsResponse.ARCount);
-        
-        memoryStream.Write(headerBytes);
-
-        foreach (var question in dnsResponse.Questions)
-        {
-            WriteName(memoryStream, question.Name, namePositions);
-            
-            var questionBytes = new byte[4];
-
-            // Encode Type
-            BinaryPrimitives.WriteUInt16BigEndian(questionBytes.AsSpan(0, 2), (ushort)question.Type);
-
-            // Encode Class
-            BinaryPrimitives.WriteUInt16BigEndian(questionBytes.AsSpan(2, 2), (ushort)question.Class);
-            
-            memoryStream.Write(questionBytes);
-        }
-
-        foreach (var answer in dnsResponse.Answers)
-        {
-            if (answer is ARecord aRecord)
-            {
-                WriteName(memoryStream, aRecord.Name, namePositions);
-
-                var answerBytes = new byte[8];
-
-                // Encode Type
-                BinaryPrimitives.WriteUInt16BigEndian(answerBytes.AsSpan(0, 2), (ushort)aRecord.Type);
-
-                // Encode Class
-                BinaryPrimitives.WriteUInt16BigEndian(answerBytes.AsSpan(2, 2), (ushort)aRecord.Class);
-
-                // Encode TTL
-                BinaryPrimitives.WriteUInt32BigEndian(answerBytes.AsSpan(4, 4), aRecord.Ttl);
-                
-                memoryStream.Write(answerBytes);
-
-                var ipAddressBytes = aRecord.IpAddress.GetAddressBytes();
-                var dataLength = (ushort)ipAddressBytes.Length;
-
-                var dataLengthBytes = new byte[2];
-
-                // Encode data length
-                BinaryPrimitives.WriteUInt16BigEndian(dataLengthBytes.AsSpan(0, 2), dataLength);
-                
-                memoryStream.Write(dataLengthBytes);
-                memoryStream.Write(ipAddressBytes);
-            }
-        }
-
-        return new ReadOnlyMemory<byte>(memoryStream.ToArray());
+        _dnsResponse = dnsResponse;
     }
 
-    private static void WriteName(MemoryStream stream, string name, Dictionary<string, int> namePositions)
+    public ReadOnlyMemory<byte> GetBytes()
+    {
+        using var memoryStream = new MemoryStream(512);
+
+        WriteHeader(memoryStream, _dnsResponse);
+
+        foreach (var question in _dnsResponse.Questions)
+        {
+            WriteName(memoryStream, question.Name);
+            WriteQuestion(memoryStream, question);
+        }
+
+        foreach (var answer in _dnsResponse.Answers)
+        {
+            WriteName(memoryStream, answer.Name);
+            WriteAnswer(memoryStream, answer);
+            WriteAnswerData(memoryStream, answer);
+        }
+
+        var memory = ToReadOnlyMemory(memoryStream);
+        return memory;
+    }
+
+    private static void WriteHeader(MemoryStream memoryStream, DnsResponse dnsResponse)
+    {
+        var bytes = ArrayPool<byte>.Shared.Rent(12);
+
+        // Transaction ID
+        BinaryPrimitives.WriteUInt16BigEndian(bytes.AsSpan(0, 2), dnsResponse.ID);
+
+        // Flags
+        var flags = (ushort)((dnsResponse.QR ? 0x8000 : 0)
+                             | ((ushort)dnsResponse.OpCode << 11)
+                             | (dnsResponse.AA ? 0x0400 : 0)
+                             | (dnsResponse.TC ? 0x0200 : 0)
+                             | (dnsResponse.RD ? 0x0100 : 0)
+                             | (dnsResponse.RA ? 0x0080 : 0)
+                             | (dnsResponse.Z << 4)
+                             | (ushort)dnsResponse.RCode);
+        BinaryPrimitives.WriteUInt16BigEndian(bytes.AsSpan(2, 2), flags);
+
+        // Question Count
+        BinaryPrimitives.WriteUInt16BigEndian(bytes.AsSpan(4, 2), dnsResponse.QDCount);
+
+        // Answer Record Count
+        BinaryPrimitives.WriteUInt16BigEndian(bytes.AsSpan(6, 2), dnsResponse.ANCount);
+
+        // Authority Record Count
+        BinaryPrimitives.WriteUInt16BigEndian(bytes.AsSpan(8, 2), dnsResponse.NSCount);
+
+        // Additional Record Count
+        BinaryPrimitives.WriteUInt16BigEndian(bytes.AsSpan(10, 2), dnsResponse.ARCount);
+
+        // Write header
+        memoryStream.Write(bytes, 0, 12);
+        
+        ArrayPool<byte>.Shared.Return(bytes);
+    }
+
+    private static void WriteQuestion(MemoryStream memoryStream, DnsQuestion question)
+    {
+        var bytes = ArrayPool<byte>.Shared.Rent(4);
+
+        // Encode Type
+        BinaryPrimitives.WriteUInt16BigEndian(bytes.AsSpan(0, 2), (ushort)question.Type);
+
+        // Encode Class
+        BinaryPrimitives.WriteUInt16BigEndian(bytes.AsSpan(2, 2), (ushort)question.Class);
+
+        // Write question
+        memoryStream.Write(bytes, 0, 4);
+        
+        ArrayPool<byte>.Shared.Return(bytes);
+    }
+
+    private static void WriteAnswer(MemoryStream memoryStream, IResourceRecord resourceRecord)
+    {
+        var bytes = ArrayPool<byte>.Shared.Rent(8);
+
+        // Encode Type
+        BinaryPrimitives.WriteUInt16BigEndian(bytes.AsSpan(0, 2), (ushort)resourceRecord.Type);
+
+        // Encode Class
+        BinaryPrimitives.WriteUInt16BigEndian(bytes.AsSpan(2, 2), (ushort)resourceRecord.Class);
+
+        // Encode TTL
+        BinaryPrimitives.WriteUInt32BigEndian(bytes.AsSpan(4, 4), resourceRecord.Ttl);
+
+        // Write answer
+        memoryStream.Write(bytes, 0, 8);
+        
+        ArrayPool<byte>.Shared.Return(bytes);
+    }
+
+    private static void WriteAnswerData(MemoryStream memoryStream, IResourceRecord answer)
+    {
+        if (answer is ARecord aRecord)
+            WriteARecord(memoryStream, aRecord);
+    }
+
+    private static void WriteARecord(MemoryStream memoryStream, ARecord aRecord)
+    {
+        // Encode IP address
+        var ipAddressBytes = aRecord.IpAddress.GetAddressBytes();
+        
+        // Calculate total length
+        var length = (ushort)ipAddressBytes.Length;
+
+        // Write record
+        WriteLength(memoryStream, length);
+        memoryStream.Write(ipAddressBytes, 0, ipAddressBytes.Length);
+    }
+
+    private static void WriteLength(MemoryStream memoryStream, ushort length)
+    {
+        var bytes = ArrayPool<byte>.Shared.Rent(2);
+
+        // Encode data length
+        BinaryPrimitives.WriteUInt16BigEndian(bytes.AsSpan(0, 2), length);
+
+        memoryStream.Write(bytes, 0, 2);
+        
+        ArrayPool<byte>.Shared.Return(bytes);
+    }
+
+    private void WriteName(MemoryStream memoryStream, string name)
     {
         var labels = name.Split('.');
-        for (int i = 0; i < labels.Length; i++)
+        for (var i = 0; i < labels.Length; i++)
         {
             var label = string.Join('.', labels.Skip(i));
-            if (namePositions.TryGetValue(label, out int position))
+            if (_namePositions.TryGetValue(label, out var position))
             {
                 // Write pointer to the existing label
                 var pointer = (ushort)(0xC000 | position);
-                var pointerBytes = new byte[2];
-                BinaryPrimitives.WriteUInt16BigEndian(pointerBytes.AsSpan(), pointer);
-                stream.Write(pointerBytes);
+                var pointerBytes = ArrayPool<byte>.Shared.Rent(2);
+                BinaryPrimitives.WriteUInt16BigEndian(pointerBytes.AsSpan(0, 2), pointer);
+                memoryStream.Write(pointerBytes, 0, 2);
+                ArrayPool<byte>.Shared.Return(pointerBytes);
                 return;
             }
-            else
-            {
-                // Write the label length and content
-                var labelBytes = Encoding.ASCII.GetBytes(labels[i]);
-                stream.WriteByte((byte)labelBytes.Length);
-                stream.Write(labelBytes);
-                // Store position of this label
-                namePositions[label] = (int)stream.Position - labelBytes.Length - 1;
-            }
+            // Write the label length and content
+            var labelBytes = Encoding.ASCII.GetBytes(labels[i]);
+            memoryStream.WriteByte((byte)labelBytes.Length);
+            memoryStream.Write(labelBytes);
+            // Store position of this label
+            _namePositions[label] = (int)memoryStream.Position - labelBytes.Length - 1;
         }
         // Write the final zero byte
-        stream.WriteByte(0);
+        memoryStream.WriteByte(0);
+    }
+
+    private ReadOnlyMemory<byte> ToReadOnlyMemory(MemoryStream memoryStream)
+    {
+        var length = (int)memoryStream.Position;
+        
+        _bytes = ArrayPool<byte>.Shared.Rent(length);
+        
+        memoryStream.Position = 0;
+        memoryStream.ReadExactly(_bytes, 0, length);
+        
+        var memory = new ReadOnlyMemory<byte>(_bytes, 0, length);
+        
+        return memory;
+    }
+
+    public void Dispose()
+    {
+        ArrayPool<byte>.Shared.Return(_bytes);
     }
 }

@@ -1,5 +1,4 @@
-﻿using System.Buffers.Binary;
-using DnsServerKit.Parameters;
+﻿using DnsServerKit.Parameters;
 
 namespace DnsServerKit.Queries;
 

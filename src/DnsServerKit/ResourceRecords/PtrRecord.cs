@@ -3,7 +3,7 @@ using DnsServerKit.Parameters;
 
 namespace DnsServerKit.ResourceRecords;
 
-public sealed record ARecord : IResourceRecord
+public sealed record PtrRecord : IResourceRecord
 {
     /// <inheritdoc/>
     public required string Name { get; init; }
@@ -16,9 +16,4 @@ public sealed record ARecord : IResourceRecord
     
     /// <inheritdoc/>
     public uint Ttl { get; init; }
-
-    /// <summary>
-    /// Gets the IP address for the resource record.
-    /// </summary>
-    public required IPAddress IpAddress { get; init; }
 }
