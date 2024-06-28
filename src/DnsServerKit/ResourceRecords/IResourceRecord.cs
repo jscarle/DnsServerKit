@@ -10,7 +10,5 @@ public interface IResourceRecord
     
     DnsClass Class { get; }
     
-    int Ttl { get; }
-    
-    ReadOnlyMemory<byte> ResourceData { get; }
+    uint Ttl { get; }
 }

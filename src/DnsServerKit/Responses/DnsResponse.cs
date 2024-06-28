@@ -1,5 +1,4 @@
-﻿using System.Buffers.Binary;
-using DnsServerKit.Parameters;
+﻿using DnsServerKit.Parameters;
 using DnsServerKit.Queries;
 using DnsServerKit.ResourceRecords;
 
@@ -105,43 +104,5 @@ public sealed record DnsResponse
         ARCount = 0;
         Questions = query.Questions;
         Answers = new List<IResourceRecord>();
-    }
-    
-    public ReadOnlyMemory<byte> HeaderData
-    {
-        get
-        {
-            byte[] header = new byte[12];
-
-            // Transaction ID
-            BinaryPrimitives.WriteUInt16BigEndian(header.AsSpan(0, 2), ID);
-
-            // Flags
-            var flags = (ushort)(
-                (QR ? 0x8000 : 0) |
-                ((ushort)OpCode << 11) |
-                (AA ? 0x0400 : 0) |
-                (TC ? 0x0200 : 0) |
-                (RD ? 0x0100 : 0) |
-                (RA ? 0x0080 : 0) |
-                (Z << 4) |
-                (ushort)RCode
-            );
-            BinaryPrimitives.WriteUInt16BigEndian(header.AsSpan(2, 2), flags);
-
-            // Question Count
-            BinaryPrimitives.WriteUInt16BigEndian(header.AsSpan(4, 2), QDCount);
-
-            // Answer Record Count
-            BinaryPrimitives.WriteUInt16BigEndian(header.AsSpan(6, 2), ANCount);
-
-            // Authority Record Count
-            BinaryPrimitives.WriteUInt16BigEndian(header.AsSpan(8, 2), NSCount);
-
-            // Additional Record Count
-            BinaryPrimitives.WriteUInt16BigEndian(header.AsSpan(10, 2), ARCount);
-
-            return new ReadOnlyMemory<byte>(header);
-        }
     }
 }
