@@ -7,6 +7,7 @@ using DnsServerKit.Parameters;
 using DnsServerKit.Queries;
 using DnsServerKit.ResourceRecords;
 using DnsServerKit.Responses;
+using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 
@@ -14,13 +15,15 @@ namespace DnsServerKit;
 
 public sealed class DnsServer : IHostedService, IAsyncDisposable
 {
+    private readonly IMemoryCache _memoryCache;
     private readonly ILogger<DnsServer> _logger;
     private CancellationTokenSource? _cts;
     private Socket? _udpSocket;
     private Task? _listeningTask;
 
-    public DnsServer(ILogger<DnsServer> logger)
+    public DnsServer(IMemoryCache memoryCache, ILogger<DnsServer> logger)
     {
+        _memoryCache = memoryCache;
         _logger = logger;
     }
 
@@ -81,9 +84,10 @@ public sealed class DnsServer : IHostedService, IAsyncDisposable
                 }
                 
                 //LogQuery(receiveResult.ReceivedBytes, dnsQuery);
-                
+
                 var dnsResponse = CreateDnsResponse(dnsQuery);
                 
+                Debug.Assert(dnsResponse is not null);
 
                 using var dnsWriter = new DnsWriter(dnsResponse);
                 var sendBuffer = dnsWriter.GetBytes();
