@@ -1,5 +1,6 @@
 using System.Buffers.Binary;
 using DnsServerKit.Parameters;
+using DnsServerKit.Queries;
 using Xunit;
 
 namespace DnsServerKit.Tests;
@@ -7,32 +8,31 @@ namespace DnsServerKit.Tests;
 public sealed class DnsReaderTests
 {
     [Fact]
-    public void TryReadBytes_WhenHeaderIsTruncated_ReturnsFailureWithoutResponse()
+    public void Read_WhenHeaderIsTruncated_DropsPacketWithoutResponse()
     {
+        var context = new DnsQueryContext();
         for (var packetLength = 0; packetLength < 12; packetLength++)
         {
-            var packet = new byte[packetLength];
+            var result = DnsReader.Read(new byte[packetLength], context);
 
-            var result = DnsReader.TryReadBytes(packet);
-
-            Assert.True(result.IsFailure(out var error, out _));
-            var readError = Assert.IsType<DnsReadError>(error);
-            Assert.Null(readError.Response);
+            Assert.Equal(DnsReadOutcome.Drop, result.Outcome);
+            Assert.Equal(DnsReadFailure.TruncatedHeader, result.Failure);
+            Assert.Equal(default, result.ErrorResponse);
         }
     }
 
     [Fact]
-    public void TryReadBytes_WhenMessageIsResponse_ReturnsFailureWithoutResponse()
+    public void Read_WhenMessageIsResponse_DropsPacketWithoutResponse()
     {
         var packet = new byte[12];
         BinaryPrimitives.WriteUInt16BigEndian(packet, 0x1234);
         BinaryPrimitives.WriteUInt16BigEndian(packet.AsSpan(2), 0x8000);
+        var context = new DnsQueryContext();
 
-        var result = DnsReader.TryReadBytes(packet);
+        var result = DnsReader.Read(packet, context);
 
-        Assert.True(result.IsFailure(out var error, out _));
-        var readError = Assert.IsType<DnsReadError>(error);
-        Assert.Null(readError.Response);
+        Assert.Equal(DnsReadOutcome.Drop, result.Outcome);
+        Assert.Equal(DnsReadFailure.InboundResponse, result.Failure);
     }
 
     [Theory]
@@ -43,27 +43,23 @@ public sealed class DnsReaderTests
     [InlineData(5)]
     [InlineData(6)]
     [InlineData(15)]
-    public void TryReadBytes_WhenOperationIsUnsupported_ReturnsNotImplementedResponse(int operation)
+    public void Read_WhenOperationIsUnsupported_ReturnsNotImplemented(int operation)
     {
-        var packet = new byte[12];
-        BinaryPrimitives.WriteUInt16BigEndian(packet, 0x1234);
         var flags = (ushort)((operation << 11) | 0x0100);
-        BinaryPrimitives.WriteUInt16BigEndian(packet.AsSpan(2), flags);
+        var packet = DnsTestPacket.CreateQuery(flags: flags);
+        var context = new DnsQueryContext();
 
-        var result = DnsReader.TryReadBytes(packet);
+        var result = DnsReader.Read(packet, context);
 
-        Assert.True(result.IsFailure(out var error, out _));
-        var readError = Assert.IsType<DnsReadError>(error);
-        Assert.True(readError.Response.HasValue);
-        var response = readError.Response.Value;
-        Assert.Equal(0x1234, response.TransactionId);
-        Assert.Equal(operation, (byte)response.Operation);
-        Assert.True(response.RecursionDesired);
-        Assert.Equal(ResponseCode.NotImplemented, response.ResponseCode);
+        Assert.Equal(DnsReadOutcome.ErrorResponse, result.Outcome);
+        Assert.Equal(DnsReadFailure.UnsupportedOperation, result.Failure);
+        Assert.Equal((byte)operation, result.ErrorResponse.Operation);
+        Assert.True(result.ErrorResponse.RecursionDesired);
+        Assert.Equal(ResponseCode.NotImplemented, result.ErrorResponse.ResponseCode);
     }
 
     [Fact]
-    public void TryReadBytes_WhenQueryHeaderIsInvalid_ReturnsFormatErrorResponse()
+    public void Read_WhenQueryHeaderIsInvalid_ReturnsFormatError()
     {
         (ushort Flags, ushort QuestionCount, ushort AnswerCount, ushort AuthorityCount, ushort AdditionalCount)[] invalidHeaders =
         [
@@ -78,219 +74,145 @@ public sealed class DnsReaderTests
             (0x0000, 1, 0, 1, 0),
             (0x0000, 1, 0, 0, 1),
         ];
+        var context = new DnsQueryContext();
 
         foreach (var invalidHeader in invalidHeaders)
         {
-            var packet = new byte[17];
-            BinaryPrimitives.WriteUInt16BigEndian(packet, 0x1234);
-            BinaryPrimitives.WriteUInt16BigEndian(packet.AsSpan(2), invalidHeader.Flags);
-            BinaryPrimitives.WriteUInt16BigEndian(packet.AsSpan(4), invalidHeader.QuestionCount);
-            BinaryPrimitives.WriteUInt16BigEndian(packet.AsSpan(6), invalidHeader.AnswerCount);
-            BinaryPrimitives.WriteUInt16BigEndian(packet.AsSpan(8), invalidHeader.AuthorityCount);
-            BinaryPrimitives.WriteUInt16BigEndian(packet.AsSpan(10), invalidHeader.AdditionalCount);
-            packet[12] = 0x00;
-            BinaryPrimitives.WriteUInt16BigEndian(packet.AsSpan(13), (ushort)RecordType.A);
-            BinaryPrimitives.WriteUInt16BigEndian(packet.AsSpan(15), (ushort)DnsClass.Internet);
+            var packet = DnsTestPacket.CreateQuery(
+                flags: invalidHeader.Flags,
+                questionCount: invalidHeader.QuestionCount,
+                answerCount: invalidHeader.AnswerCount,
+                authorityCount: invalidHeader.AuthorityCount,
+                additionalCount: invalidHeader.AdditionalCount);
 
-            var result = DnsReader.TryReadBytes(packet);
+            var result = DnsReader.Read(packet, context);
 
-            Assert.True(result.IsFailure(out var error, out _));
-            var readError = Assert.IsType<DnsReadError>(error);
-            Assert.True(readError.Response.HasValue);
-            Assert.Equal(ResponseCode.FormatError, readError.Response.Value.ResponseCode);
+            Assert.Equal(DnsReadOutcome.ErrorResponse, result.Outcome);
+            Assert.Equal(DnsReadFailure.InvalidHeader, result.Failure);
+            Assert.Equal(ResponseCode.FormatError, result.ErrorResponse.ResponseCode);
         }
     }
 
     [Fact]
-    public void TryReadBytes_WhenAuthenticDataAndCheckingDisabledFlagsAreSet_ReadsQuery()
+    public void Read_WhenAuthenticDataAndCheckingDisabledAreSet_ReadsQuery()
     {
-        byte[] dnsQuery =
-        [
-            0x12, 0x34,
-            0x00, 0x30,
-            0x00, 0x01,
-            0x00, 0x00,
-            0x00, 0x00,
-            0x00, 0x00,
-            0x00,
-            0x00, 0x01,
-            0x00, 0x01,
-        ];
+        var packet = DnsTestPacket.CreateQuery(flags: 0x0030);
+        var context = new DnsQueryContext();
 
-        var result = DnsReader.TryReadBytes(dnsQuery);
+        var result = DnsReader.Read(packet, context);
 
-        Assert.False(result.IsFailure(out _, out _));
+        Assert.Equal(DnsReadOutcome.Query, result.Outcome);
+        Assert.True(context.AuthenticData);
+        Assert.True(context.CheckingDisabled);
     }
 
     [Fact]
-    public void TryReadBytes_WhenQuestionCountIsMaximum_DoesNotAllocateFromQuestionCount()
+    public void Read_WhenQuestionNameIsMalformed_ReturnsFormatError()
     {
-        var packet = new byte[12];
-        BinaryPrimitives.WriteUInt16BigEndian(packet, 0x1234);
-        BinaryPrimitives.WriteUInt16BigEndian(packet.AsSpan(4), ushort.MaxValue);
-        _ = DnsReader.TryReadBytes(packet);
+        byte[][] packets =
+        [
+            [0x12, 0x34, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0xC0, 0x0C, 0, 1, 0, 1],
+            [0x12, 0x34, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0x40, 0, 1, 0, 1],
+            [0x12, 0x34, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 3, (byte)'w'],
+        ];
+        var context = new DnsQueryContext();
 
-        var allocatedBytesBefore = GC.GetAllocatedBytesForCurrentThread();
-        var result = DnsReader.TryReadBytes(packet);
-        var allocatedBytes = GC.GetAllocatedBytesForCurrentThread() - allocatedBytesBefore;
+        foreach (var packet in packets)
+        {
+            var result = DnsReader.Read(packet, context);
 
-        Assert.True(result.IsFailure(out var error, out _));
-        Assert.IsType<DnsReadError>(error);
-        Assert.InRange(allocatedBytes, 0, 16 * 1024);
+            Assert.Equal(DnsReadOutcome.ErrorResponse, result.Outcome);
+            Assert.Equal(DnsReadFailure.InvalidName, result.Failure);
+            Assert.Equal(ResponseCode.FormatError, result.ErrorResponse.ResponseCode);
+            Assert.Null(result.Exception);
+        }
     }
 
     [Fact]
-    public void DecodeDnsName_WhenPointerReferencesPriorName_DecodesNameAndAdvancesPastPointer()
+    public void Read_WhenQuestionIsTruncated_ReturnsFormatError()
     {
-        byte[] packet =
-        [
-            0x03, (byte)'w', (byte)'w', (byte)'w', 0x00,
-            0xC0, 0x00,
-        ];
-        var offset = 5;
+        byte[] packet = [0x12, 0x34, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        var context = new DnsQueryContext();
 
-        var name = NameHelper.DecodeDnsName(packet, ref offset);
+        var result = DnsReader.Read(packet, context);
 
-        Assert.Equal("www", name);
-        Assert.Equal(7, offset);
+        Assert.Equal(DnsReadFailure.TruncatedQuestion, result.Failure);
+        Assert.Equal(ResponseCode.FormatError, result.ErrorResponse.ResponseCode);
     }
 
     [Fact]
-    public void DecodeDnsName_WhenLabelsEndWithPointer_DecodesCompleteNameAndAdvancesPastPointer()
+    public void Read_WhenMessageContainsTrailingData_ReturnsFormatError()
     {
-        byte[] packet =
-        [
-            0x07, (byte)'e', (byte)'x', (byte)'a', (byte)'m', (byte)'p', (byte)'l', (byte)'e',
-            0x03, (byte)'c', (byte)'o', (byte)'m', 0x00,
-            0x03, (byte)'w', (byte)'w', (byte)'w', 0xC0, 0x00,
-        ];
-        var offset = 13;
+        var validPacket = DnsTestPacket.CreateQuery();
+        var packet = new byte[validPacket.Length + 1];
+        validPacket.CopyTo(packet, 0);
+        packet[^1] = 0xFF;
+        var context = new DnsQueryContext();
 
-        var name = NameHelper.DecodeDnsName(packet, ref offset);
+        var result = DnsReader.Read(packet, context);
 
-        Assert.Equal("www.example.com", name);
-        Assert.Equal(19, offset);
+        Assert.Equal(DnsReadFailure.TrailingData, result.Failure);
+        Assert.Equal(ResponseCode.FormatError, result.ErrorResponse.ResponseCode);
     }
 
     [Fact]
-    public void TryReadBytes_WhenNamePointerReferencesItself_ReturnsFailure()
+    public void Read_WhenQuestionTypeAndClassAreUnregistered_PreservesWireValues()
     {
-        byte[] dnsQuery =
-        [
-            0x12, 0x34,
-            0x00, 0x00,
-            0x00, 0x01,
-            0x00, 0x00,
-            0x00, 0x00,
-            0x00, 0x00,
-            0xC0, 0x0C,
-            0x00, 0x01,
-            0x00, 0x01,
-        ];
+        const ushort type = 65400;
+        const ushort @class = 65399;
+        var packet = DnsTestPacket.CreateQuery(type: type, @class: @class);
+        var context = new DnsQueryContext();
 
-        var result = DnsReader.TryReadBytes(dnsQuery);
+        var result = DnsReader.Read(packet, context);
 
-        Assert.True(result.IsFailure(out var error, out _));
-        var readError = Assert.IsType<DnsReadError>(error);
-        Assert.True(readError.Response.HasValue);
-        Assert.Equal(ResponseCode.FormatError, readError.Response.Value.ResponseCode);
-        Assert.IsType<FormatException>(readError.Exception);
+        Assert.Equal(DnsReadOutcome.Query, result.Outcome);
+        Assert.Equal(type, context.Question.Type);
+        Assert.Equal(@class, context.Question.Class);
     }
 
     [Fact]
-    public void TryReadBytes_WhenReceivedDatagramEndsInsideName_DoesNotReadRemainingBufferBytes()
+    public void Materialize_WhenContextAndBufferAreReused_RetainsOriginalQuery()
     {
-        byte[] receiveBuffer =
-        [
-            0x12, 0x34,
-            0x00, 0x00,
-            0x00, 0x01,
-            0x00, 0x00,
-            0x00, 0x00,
-            0x00, 0x00,
-            0x03, (byte)'w', (byte)'w', (byte)'w',
-            0x00,
-            0x00, 0x01,
-            0x00, 0x01,
-        ];
-        const int receivedBytes = 16;
-        var receivedDatagram = receiveBuffer.AsMemory(0, receivedBytes);
+        var buffer = new byte[512];
+        var firstPacket = DnsTestPacket.CreateQuery("first.example", transactionId: 0x1111);
+        firstPacket.CopyTo(buffer, 0);
+        var context = new DnsQueryContext();
+        _ = DnsReader.Read(buffer.AsMemory(0, firstPacket.Length), context);
+        var materialized = context.Materialize();
 
-        var fullBufferResult = DnsReader.TryReadBytes(receiveBuffer);
-        var receivedDatagramResult = DnsReader.TryReadBytes(receivedDatagram);
+        var secondPacket = DnsTestPacket.CreateQuery("second.example", transactionId: 0x2222);
+        secondPacket.CopyTo(buffer, 0);
+        _ = DnsReader.Read(buffer.AsMemory(0, secondPacket.Length), context);
 
-        Assert.False(fullBufferResult.IsFailure(out _, out _));
-        Assert.True(receivedDatagramResult.IsFailure(out _, out _));
+        Assert.Equal((ushort)0x1111, materialized.TransactionId);
+        Assert.Equal((byte)DnsOperation.Query, materialized.Operation);
+        Assert.Equal("first.example", materialized.Question.Name.Value);
+        Assert.Equal((ushort)RecordType.A, materialized.Question.Type);
+        Assert.Equal((ushort)DnsClass.Internet, materialized.Question.Class);
+        Assert.Equal((ushort)0x2222, context.TransactionId);
+        Assert.Equal("second.example", context.Question.MaterializeName().Value);
     }
 
     [Fact]
-    public void TryReadBytes_WhenQuestionTypeIsUnregistered_PreservesWireValue()
+    public void Read_WhenWarmed_DoesNotAllocateForSuccessOrExpectedFailure()
     {
-        const ushort unregisteredRecordType = 65400;
-        byte[] dnsQuery =
-        [
-            0x12, 0x34,
-            0x00, 0x00,
-            0x00, 0x01,
-            0x00, 0x00,
-            0x00, 0x00,
-            0x00, 0x00,
-            0x00,
-            unregisteredRecordType >> 8, unregisteredRecordType & 0xFF,
-            0x00, 0x01,
-        ];
+        var validPacket = DnsTestPacket.CreateQuery();
+        var invalidPacket = DnsTestPacket.CreateQuery(questionCount: ushort.MaxValue);
+        var context = new DnsQueryContext();
+        _ = DnsReader.Read(validPacket, context);
+        _ = DnsReader.Read(invalidPacket, context);
 
-        var result = DnsReader.TryReadBytes(dnsQuery);
+        var beforeValid = GC.GetAllocatedBytesForCurrentThread();
+        var validResult = DnsReader.Read(validPacket, context);
+        var validAllocations = GC.GetAllocatedBytesForCurrentThread() - beforeValid;
 
-        Assert.False(result.IsFailure(out _, out var parsedQuery));
-        Assert.Equal(unregisteredRecordType, (ushort)parsedQuery.Questions[0].Type);
-    }
+        var beforeInvalid = GC.GetAllocatedBytesForCurrentThread();
+        var invalidResult = DnsReader.Read(invalidPacket, context);
+        var invalidAllocations = GC.GetAllocatedBytesForCurrentThread() - beforeInvalid;
 
-    [Fact]
-    public void TryReadBytes_WhenQuestionClassIsUnregistered_PreservesWireValue()
-    {
-        const ushort unregisteredDnsClass = 65400;
-        byte[] dnsQuery =
-        [
-            0x12, 0x34,
-            0x00, 0x00,
-            0x00, 0x01,
-            0x00, 0x00,
-            0x00, 0x00,
-            0x00, 0x00,
-            0x00,
-            0x00, 0x01,
-            unregisteredDnsClass >> 8, unregisteredDnsClass & 0xFF,
-        ];
-
-        var result = DnsReader.TryReadBytes(dnsQuery);
-
-        Assert.False(result.IsFailure(out _, out var parsedQuery));
-        Assert.Equal(unregisteredDnsClass, (ushort)parsedQuery.Questions[0].Class);
-    }
-
-    [Fact]
-    public void TryReadBytes_WhenMessageContainsTrailingData_ReturnsFormatErrorResponse()
-    {
-        byte[] dnsQuery =
-        [
-            0x12, 0x34,
-            0x00, 0x00,
-            0x00, 0x01,
-            0x00, 0x00,
-            0x00, 0x00,
-            0x00, 0x00,
-            0x00,
-            0x00, 0x01,
-            0x00, 0x01,
-            0xFF,
-        ];
-
-        var result = DnsReader.TryReadBytes(dnsQuery);
-
-        Assert.True(result.IsFailure(out var error, out _));
-        var readError = Assert.IsType<DnsReadError>(error);
-        Assert.True(readError.Response.HasValue);
-        Assert.Equal(ResponseCode.FormatError, readError.Response.Value.ResponseCode);
+        Assert.Equal(DnsReadOutcome.Query, validResult.Outcome);
+        Assert.Equal(DnsReadOutcome.ErrorResponse, invalidResult.Outcome);
+        Assert.Equal(0, validAllocations);
+        Assert.Equal(0, invalidAllocations);
     }
 }

@@ -1,16 +1,19 @@
-﻿using DnsServerKit.Parameters;
-
 namespace DnsServerKit.Queries;
 
-/// <summary>Represents a DNS question.</summary>
-public sealed record DnsQuestion
+/// <summary>Represents an immutable, retainable DNS question.</summary>
+public sealed class DnsQuestion
 {
-    /// <summary>Gets the name that is the subject of the DNS query.</summary>
-    public required string Name { get; init; }
+    public DnsName Name { get; }
 
-    /// <summary>Gets the type of DNS record being queried.</summary>
-    public required RecordType Type { get; init; }
+    public ushort Type { get; }
 
-    /// <summary>Gets the class of the DNS query.</summary>
-    public required DnsClass Class { get; init; }
+    public ushort Class { get; }
+
+    public DnsQuestion(DnsName name, ushort type, ushort @class)
+    {
+        ArgumentNullException.ThrowIfNull(name);
+        Name = name;
+        Type = type;
+        Class = @class;
+    }
 }

@@ -1,23 +1,20 @@
-﻿using DnsServerKit.Parameters;
+using DnsServerKit.Parameters;
 
 namespace DnsServerKit.ResourceRecords;
 
-public sealed record PtrRecord : IResourceRecord
+/// <summary>Represents an immutable domain-name pointer record.</summary>
+public sealed class PtrRecord : DnsResourceRecord
 {
-    /// <inheritdoc/>
-    public required string Name { get; init; }
-    
-    /// <inheritdoc/>
-    public RecordType Type => RecordType.Ptr;
-    
-    /// <inheritdoc/>
-    public DnsClass Class => DnsClass.Internet;
-    
-    /// <inheritdoc/>
-    public uint Ttl { get; init; }
+    public DnsName TargetName { get; }
 
-    /// <summary>
-    /// Gets the target domain name for the resource record.
-    /// </summary>
-    public required string TargetName { get; init; }
+    public PtrRecord(DnsName name, DnsName targetName, uint ttl = 0, ushort @class = (ushort)DnsClass.Internet)
+        : base(
+            name,
+            (ushort)RecordType.Ptr,
+            @class,
+            ttl,
+            (targetName ?? throw new ArgumentNullException(nameof(targetName))).WireBytes)
+    {
+        TargetName = targetName;
+    }
 }

@@ -1,174 +1,338 @@
-﻿using System.Buffers;
-using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
-using System.Text;
+using DnsServerKit.Data;
 using DnsServerKit.Parameters;
 using DnsServerKit.Queries;
-using DnsServerKit.ResourceRecords;
 using DnsServerKit.Responses;
-using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 
 namespace DnsServerKit;
 
-public sealed class DnsServer(IMemoryCache memoryCache, ILogger<DnsServer> logger) : IHostedService, IAsyncDisposable
+public sealed partial class DnsServer : IHostedService, IAsyncDisposable
 {
-    private readonly IMemoryCache _memoryCache = memoryCache;
-    private CancellationTokenSource? _cts;
+    private const int MaximumUdpMessageLength = 512;
+    private readonly DnsDataSetStore _dataSetStore;
+    private readonly DnsServerOptions _options;
+    private readonly ILogger<DnsServer> _logger;
+    private CancellationTokenSource? _stopSource;
     private Socket? _udpSocket;
-    private Task? _listeningTask;
+    private DnsWorker[]? _workers;
+    private Task[]? _workerTasks;
+    private Task? _statisticsTask;
+
+    public IPEndPoint? BoundEndPoint => _udpSocket?.LocalEndPoint as IPEndPoint;
+
+    public DnsServer(DnsDataSetStore dataSetStore, DnsServerOptions options, ILogger<DnsServer> logger)
+    {
+        ArgumentNullException.ThrowIfNull(dataSetStore);
+        ArgumentNullException.ThrowIfNull(options);
+        ArgumentNullException.ThrowIfNull(logger);
+        _dataSetStore = dataSetStore;
+        _options = options;
+        _logger = logger;
+    }
 
     public Task StartAsync(CancellationToken cancellationToken)
     {
-        _cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        cancellationToken.ThrowIfCancellationRequested();
+        if (_udpSocket is not null)
+            throw new InvalidOperationException("The DNS server has already been started.");
+        if (_options.ListenAddress is null)
+            throw new InvalidOperationException("A listen address is required.");
+        if (_options.ListenAddress.AddressFamily != AddressFamily.InterNetwork)
+            throw new InvalidOperationException("This server currently supports only IPv4 UDP sockets.");
+        if (_options.Port is < 0 or > ushort.MaxValue)
+            throw new InvalidOperationException("The DNS server port must be between 0 and 65,535.");
+        if (_options.WorkerCount <= 0)
+            throw new InvalidOperationException("The DNS worker count must be greater than zero.");
+        if (_options.ReceiveBufferSize < MaximumUdpMessageLength)
+            throw new InvalidOperationException("The socket receive buffer must be at least 512 bytes.");
+        if (_options.StatisticsInterval <= TimeSpan.Zero)
+            throw new InvalidOperationException("The statistics interval must be greater than zero.");
 
-        _udpSocket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
-        var localEndpoint = new IPEndPoint(IPAddress.Any, 53);
-        _udpSocket.Bind(localEndpoint);
-        
-        _listeningTask = ListenForQueriesAsync(_cts.Token);
+        var socket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp)
+        {
+            ReceiveBufferSize = _options.ReceiveBufferSize,
+        };
+
+        try
+        {
+            socket.Bind(new IPEndPoint(_options.ListenAddress, _options.Port));
+        }
+        catch
+        {
+            socket.Dispose();
+            throw;
+        }
+
+        _udpSocket = socket;
+        _stopSource = new CancellationTokenSource();
+        _workers = new DnsWorker[_options.WorkerCount];
+        _workerTasks = new Task[_options.WorkerCount];
+
+        for (var workerIndex = 0; workerIndex < _workers.Length; workerIndex++)
+        {
+            var worker = new DnsWorker(workerIndex);
+            _workers[workerIndex] = worker;
+            _workerTasks[workerIndex] = RunWorkerAsync(socket, worker, _stopSource.Token);
+        }
+
+        _statisticsTask = ReportStatisticsAsync(_workers, _stopSource.Token);
+        LogServerStarted(_logger, BoundEndPoint, _workers.Length, socket.ReceiveBufferSize);
 
         return Task.CompletedTask;
     }
 
-    public Task StopAsync(CancellationToken cancellationToken)
+    public async Task StopAsync(CancellationToken cancellationToken)
     {
-        _cts?.Cancel();
-        
-        return _listeningTask ?? Task.CompletedTask;
+        var socket = Interlocked.Exchange(ref _udpSocket, null);
+        if (socket is null)
+            return;
+
+        _stopSource?.Cancel();
+        socket.Dispose();
+
+        if (_workerTasks is not null)
+            await Task.WhenAll(_workerTasks).WaitAsync(cancellationToken).ConfigureAwait(false);
+
+        if (_statisticsTask is not null)
+            await _statisticsTask.WaitAsync(cancellationToken).ConfigureAwait(false);
+
+        LogServerStopped(_logger);
     }
 
     public async ValueTask DisposeAsync()
     {
-        if (_listeningTask != null)
-            await _listeningTask;
-
-        if (_udpSocket != null)
-        {
-            _udpSocket.Close();
-            _udpSocket.Dispose();
-        }
-
-        _cts?.Dispose();
+        await StopAsync(CancellationToken.None).ConfigureAwait(false);
+        _stopSource?.Dispose();
     }
 
-    private async Task ListenForQueriesAsync(CancellationToken cancellationToken)
+    private async Task RunWorkerAsync(Socket socket, DnsWorker worker, CancellationToken stoppingToken)
     {
-        Debug.Assert(_udpSocket is not null);
-
-        logger.LogInformation("Starting to listen...");
-
-        var remoteEndpoint = new IPEndPoint(IPAddress.Any, 0);
-
-        var memoryOwner = MemoryPool<byte>.Shared.Rent(512);
-        var receiveBuffer = memoryOwner.Memory;
-
-        while (!cancellationToken.IsCancellationRequested)
+        while (!stoppingToken.IsCancellationRequested)
         {
+            var hasTrustedQuery = false;
             try
             {
-                var receiveResult = await _udpSocket.ReceiveFromAsync(receiveBuffer, SocketFlags.None, remoteEndpoint, cancellationToken);
-                var receivedDatagram = receiveBuffer[..receiveResult.ReceivedBytes];
-                if (DnsReader.TryReadBytes(receivedDatagram).IsFailure(out var error, out var dnsQuery))
+                var receivedBytes = await socket.ReceiveFromAsync(
+                    worker.Buffer.AsMemory(),
+                    SocketFlags.None,
+                    worker.RemoteAddress,
+                    CancellationToken.None).ConfigureAwait(false);
+                worker.Received++;
+
+                var datagram = worker.Buffer.AsMemory(0, receivedBytes);
+                var readResult = DnsReader.Read(datagram, worker.Query);
+                if (readResult.Outcome == DnsReadOutcome.Drop)
                 {
-                    if (error is not DnsReadError dnsReadError)
-                    {
-                        logger.LogError("{Error}", error.Message);
-                        continue;
-                    }
-
-                    if (dnsReadError.Response is { ResponseCode: ResponseCode.ServerFailure })
-                        logger.LogError(error.Exception, "{Error}", error.Message);
-                    else
-                        logger.LogDebug("{Error}", error.Message);
-
-                    if (dnsReadError.Response is not { } errorResponse)
-                        continue;
-
-                    var errorResponseLength = DnsWriter.WriteErrorResponse(receiveBuffer.Span, errorResponse, true);
-                    var errorResponseBuffer = receiveBuffer[..errorResponseLength];
-                    await _udpSocket.SendToAsync(
-                        errorResponseBuffer,
-                        SocketFlags.None,
-                        receiveResult.RemoteEndPoint,
-                        cancellationToken);
-
+                    worker.Dropped++;
                     continue;
                 }
-                
-                LogQuery(receiveResult.ReceivedBytes, dnsQuery);
 
-                var dnsResponse = CreateDnsResponse(dnsQuery);
-                
-                Debug.Assert(dnsResponse is not null);
+                if (readResult.Outcome == DnsReadOutcome.ErrorResponse)
+                {
+                    if (readResult.Failure == DnsReadFailure.UnsupportedOperation)
+                    {
+                        worker.Unsupported++;
+                    }
+                    else if (readResult.Failure == DnsReadFailure.UnexpectedException)
+                    {
+                        worker.UnexpectedFailures++;
+                        LogUnexpectedFailure(_logger, readResult.Exception, worker.Id);
+                    }
+                    else
+                    {
+                        worker.Malformed++;
+                    }
 
-                using var dnsWriter = new DnsWriter(dnsResponse);
-                var sendBuffer = dnsWriter.GetBytes();
-                var sentBytes = await _udpSocket.SendToAsync(sendBuffer, SocketFlags.None, receiveResult.RemoteEndPoint, cancellationToken);
-                LogResponse(sentBytes, dnsResponse);
+                    var errorLength = DnsWriter.WriteErrorResponse(
+                        worker.Buffer,
+                        readResult.ErrorResponse,
+                        _options.RecursionAvailable);
+                    await socket.SendToAsync(
+                        worker.Buffer.AsMemory(0, errorLength),
+                        SocketFlags.None,
+                        worker.RemoteAddress,
+                        CancellationToken.None).ConfigureAwait(false);
+                    worker.ResponsesSent++;
+                    continue;
+                }
+
+                hasTrustedQuery = true;
+                var dataSet = _dataSetStore.Current;
+                if (dataSet.TryResolve(worker.Query.Question, out var answerSet))
+                {
+                    worker.Response.Set(
+                        worker.Query,
+                        answerSet,
+                        ResponseCode.NoError,
+                        false,
+                        _options.RecursionAvailable);
+                }
+                else
+                {
+                    worker.Response.Set(
+                        worker.Query,
+                        null,
+                        ResponseCode.NotZone,
+                        false,
+                        _options.RecursionAvailable);
+                }
+
+                var responseLength = DnsWriter.Write(worker.Buffer, worker.Response);
+                if ((worker.Buffer[2] & 0x02) != 0)
+                    worker.Truncated++;
+
+                await socket.SendToAsync(
+                    worker.Buffer.AsMemory(0, responseLength),
+                    SocketFlags.None,
+                    worker.RemoteAddress,
+                    CancellationToken.None).ConfigureAwait(false);
+                worker.Answered++;
+                worker.ResponsesSent++;
             }
-            catch (OperationCanceledException)
+            catch (SocketException) when (stoppingToken.IsCancellationRequested)
             {
                 break;
             }
-            catch (Exception ex)
+            catch (ObjectDisposedException) when (stoppingToken.IsCancellationRequested)
             {
-                logger.LogError(ex, "An exception occured while processing the DNS request.");
+                break;
             }
-        }
-    }
-
-    private static DnsResponse CreateDnsResponse(DnsQuery dnsQuery)
-    {
-        var answers = new List<IResourceRecord>();
-
-        foreach (var question in dnsQuery.Questions)
-        {
-            if (question is { Class: DnsClass.Internet, Type: RecordType.A })
+            catch (SocketException)
             {
-                answers.Add(new ARecord
+                worker.SocketFailures++;
+            }
+            catch (Exception exception)
+            {
+                worker.UnexpectedFailures++;
+                LogUnexpectedFailure(_logger, exception, worker.Id);
+
+                if (!hasTrustedQuery)
+                    continue;
+
+                try
                 {
-                    Name = question.Name,
-                    IpAddress = IPAddress.Parse("151.101.2.217"),
-                });
-            }
-            if (question is { Class: DnsClass.Internet, Type: RecordType.Ptr })
-            {
-                answers.Add(new PtrRecord
+                    var serverFailureResponse = new DnsErrorResponse(
+                        worker.Query.TransactionId,
+                        worker.Query.Operation,
+                        worker.Query.RecursionDesired,
+                        ResponseCode.ServerFailure);
+                    var errorLength = DnsWriter.WriteErrorResponse(
+                        worker.Buffer,
+                        serverFailureResponse,
+                        _options.RecursionAvailable);
+                    await socket.SendToAsync(
+                        worker.Buffer.AsMemory(0, errorLength),
+                        SocketFlags.None,
+                        worker.RemoteAddress,
+                        CancellationToken.None).ConfigureAwait(false);
+                    worker.ResponsesSent++;
+                }
+                catch (SocketException)
                 {
-                    Name = question.Name,
-                    TargetName = "localhost",
-                });
+                    worker.SocketFailures++;
+                }
             }
         }
+    }
 
-        if (answers.Count == 0)
+    private async Task ReportStatisticsAsync(DnsWorker[] workers, CancellationToken stoppingToken)
+    {
+        using var timer = new PeriodicTimer(_options.StatisticsInterval);
+        try
         {
-            return new DnsResponse(dnsQuery, false, true, ResponseCode.NotZone);
+            while (await timer.WaitForNextTickAsync(stoppingToken).ConfigureAwait(false))
+            {
+                long received = 0;
+                long answered = 0;
+                long responsesSent = 0;
+                long dropped = 0;
+                long malformed = 0;
+                long unsupported = 0;
+                long truncated = 0;
+                long socketFailures = 0;
+                long unexpectedFailures = 0;
+
+                foreach (var worker in workers)
+                {
+                    received += Volatile.Read(ref worker.Received);
+                    answered += Volatile.Read(ref worker.Answered);
+                    responsesSent += Volatile.Read(ref worker.ResponsesSent);
+                    dropped += Volatile.Read(ref worker.Dropped);
+                    malformed += Volatile.Read(ref worker.Malformed);
+                    unsupported += Volatile.Read(ref worker.Unsupported);
+                    truncated += Volatile.Read(ref worker.Truncated);
+                    socketFailures += Volatile.Read(ref worker.SocketFailures);
+                    unexpectedFailures += Volatile.Read(ref worker.UnexpectedFailures);
+                }
+
+                LogStatistics(
+                    _logger,
+                    received,
+                    answered,
+                    responsesSent,
+                    dropped,
+                    malformed,
+                    unsupported,
+                    truncated,
+                    socketFailures,
+                    unexpectedFailures);
+            }
         }
-        
-        return new DnsResponse(dnsQuery, false, true, answers);
+        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+        {
+        }
     }
 
-    private void LogQuery(int receivedBytes, DnsQuery dnsQuery)
-    {
-        var log = new StringBuilder();
-        log.AppendLine($"{receivedBytes} bytes received.");
-        log.AppendLine($"{dnsQuery}");
-        foreach(var question in dnsQuery.Questions)
-            log.AppendLine($" - {question}");
-        logger.LogInformation("{Message}", log.ToString());
-    }
+    [LoggerMessage(EventId = 1, Level = LogLevel.Information, Message = "DNS server listening on {EndPoint} with {WorkerCount} workers and a {ReceiveBufferSize}-byte socket receive buffer.")]
+    private static partial void LogServerStarted(ILogger logger, IPEndPoint? endPoint, int workerCount, int receiveBufferSize);
 
-    private void LogResponse(int receivedBytes, DnsResponse dnsResponse)
+    [LoggerMessage(EventId = 2, Level = LogLevel.Information, Message = "DNS server stopped.")]
+    private static partial void LogServerStopped(ILogger logger);
+
+    [LoggerMessage(EventId = 3, Level = LogLevel.Information, Message = "DNS totals: received={Received}, answered={Answered}, responses={ResponsesSent}, dropped={Dropped}, malformed={Malformed}, unsupported={Unsupported}, truncated={Truncated}, socketFailures={SocketFailures}, unexpectedFailures={UnexpectedFailures}.")]
+    private static partial void LogStatistics(
+        ILogger logger,
+        long received,
+        long answered,
+        long responsesSent,
+        long dropped,
+        long malformed,
+        long unsupported,
+        long truncated,
+        long socketFailures,
+        long unexpectedFailures);
+
+    [LoggerMessage(EventId = 4, Level = LogLevel.Error, Message = "Unexpected DNS worker failure on worker {WorkerId}.")]
+    private static partial void LogUnexpectedFailure(ILogger logger, Exception? exception, int workerId);
+
+    private sealed class DnsWorker
     {
-        var log = new StringBuilder();
-        log.AppendLine($"{receivedBytes} bytes received.");
-        log.AppendLine($"{dnsResponse}");
-        foreach(var answer in dnsResponse.Answers)
-            log.AppendLine($" - {answer}");
-        logger.LogInformation("{Message}", log.ToString());
+        public int Id { get; }
+
+        public byte[] Buffer { get; } = GC.AllocateUninitializedArray<byte>(MaximumUdpMessageLength, pinned: true);
+
+        public SocketAddress RemoteAddress { get; } = new(AddressFamily.InterNetwork, 16);
+
+        public DnsQueryContext Query { get; } = new();
+
+        public DnsResponseContext Response { get; } = new();
+
+        public long Received;
+        public long Answered;
+        public long ResponsesSent;
+        public long Dropped;
+        public long Malformed;
+        public long Unsupported;
+        public long Truncated;
+        public long SocketFailures;
+        public long UnexpectedFailures;
+
+        public DnsWorker(int id)
+        {
+            Id = id;
+        }
     }
 }

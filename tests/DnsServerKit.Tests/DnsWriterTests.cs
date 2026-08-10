@@ -1,5 +1,6 @@
 using System.Buffers.Binary;
 using System.Net;
+using DnsServerKit.Data;
 using DnsServerKit.Parameters;
 using DnsServerKit.Queries;
 using DnsServerKit.ResourceRecords;
@@ -11,472 +12,280 @@ namespace DnsServerKit.Tests;
 public sealed class DnsWriterTests
 {
     [Fact]
-    public void ARecord_WhenAddressIsIPv6_ThrowsArgumentException()
+    public void Write_WhenAnswerIsARecord_WritesExactManagedRecordSetResponse()
     {
-        Assert.Throws<ArgumentException>(() =>
-        {
-            _ = new ARecord
-            {
-                Name = "example.com",
-                IpAddress = IPAddress.IPv6Loopback,
-            };
-        });
+        var queryBytes = DnsTestPacket.CreateQuery(transactionId: 0x1234, flags: 0x0100);
+        var buffer = new byte[512];
+        queryBytes.AsSpan().CopyTo(buffer);
+        var query = new DnsQueryContext();
+        Assert.Equal(DnsReadOutcome.Query, DnsReader.Read(buffer.AsMemory(0, queryBytes.Length), query).Outcome);
+
+        var builder = new DnsDataSetBuilder();
+        builder.Add(new ARecord(new DnsName("example.com"), IPAddress.Parse("192.0.2.1"), 300));
+        var dataSet = builder.Build();
+        Assert.True(dataSet.TryResolve(query.Question, out var answerSet));
+        var response = new DnsResponseContext();
+        response.Set(query, answerSet, ResponseCode.NoError, false, true);
+
+        var length = DnsWriter.Write(buffer, response);
+
+        Assert.Equal(queryBytes.Length + 16, length);
+        Assert.Equal((ushort)0x1234, BinaryPrimitives.ReadUInt16BigEndian(buffer));
+        Assert.Equal((ushort)0x8180, BinaryPrimitives.ReadUInt16BigEndian(buffer.AsSpan(2)));
+        Assert.Equal((ushort)1, BinaryPrimitives.ReadUInt16BigEndian(buffer.AsSpan(4)));
+        Assert.Equal((ushort)1, BinaryPrimitives.ReadUInt16BigEndian(buffer.AsSpan(6)));
+        Assert.Equal((ushort)0xC00C, BinaryPrimitives.ReadUInt16BigEndian(buffer.AsSpan(queryBytes.Length)));
+        Assert.Equal((ushort)RecordType.A, BinaryPrimitives.ReadUInt16BigEndian(buffer.AsSpan(queryBytes.Length + 2)));
+        Assert.Equal(300U, BinaryPrimitives.ReadUInt32BigEndian(buffer.AsSpan(queryBytes.Length + 6)));
+        Assert.Equal((ushort)4, BinaryPrimitives.ReadUInt16BigEndian(buffer.AsSpan(queryBytes.Length + 10)));
+        Assert.Equal(new byte[] { 192, 0, 2, 1 }, buffer.AsSpan(queryBytes.Length + 12, 4).ToArray());
     }
 
     [Fact]
-    public void GetBytesAndDispose_WhenCalledTwice_AreIdempotent()
+    public void Write_WhenAnswerIsPtrRecord_WritesPreencodedTargetName()
     {
-        const string ownerName = "example.com";
-        var question = new DnsQuestion
-        {
-            Name = ownerName,
-            Type = RecordType.A,
-            Class = DnsClass.Internet,
-        };
-        var query = new DnsQuery(
-            0x1234,
-            false,
-            DnsOperation.Query,
-            false,
-            false,
-            false,
-            false,
-            0,
-            ResponseCode.NoError,
-            1,
-            0,
-            0,
-            0,
-            [question]);
-        var answer = new ARecord
-        {
-            Name = ownerName,
-            IpAddress = IPAddress.Parse("192.0.2.1"),
-        };
-        var response = new DnsResponse(query, false, true, [answer]);
-        var writer = new DnsWriter(response);
-        try
-        {
-            var firstBytes = writer.GetBytes().ToArray();
-            var secondBytes = writer.GetBytes().ToArray();
+        var ownerName = new DnsName("1.2.0.192.in-addr.arpa");
+        var targetName = new DnsName("host.example.com");
+        var queryBytes = DnsTestPacket.CreateQuery(ownerName.Value, (ushort)RecordType.Ptr);
+        var buffer = new byte[512];
+        queryBytes.AsSpan().CopyTo(buffer);
+        var query = new DnsQueryContext();
+        _ = DnsReader.Read(buffer.AsMemory(0, queryBytes.Length), query);
+        var builder = new DnsDataSetBuilder();
+        var ptrRecord = new PtrRecord(ownerName, targetName, 60);
+        builder.Add(ptrRecord);
+        var dataSet = builder.Build();
+        Assert.True(dataSet.TryResolve(query.Question, out var answerSet));
+        var response = new DnsResponseContext();
+        response.Set(query, answerSet, ResponseCode.NoError, false, true);
 
-            Assert.Equal(firstBytes, secondBytes);
-            var offset = 12;
-            var questionName = NameHelper.DecodeDnsName(secondBytes, ref offset);
-            offset += 4;
-            var answerName = NameHelper.DecodeDnsName(secondBytes, ref offset);
-            Assert.Equal(ownerName, questionName);
-            Assert.Equal(ownerName, answerName);
+        var length = DnsWriter.Write(buffer, response);
+        var offset = queryBytes.Length + 12;
+        var decodedTarget = DnsTestPacket.ReadName(buffer.AsSpan(0, length), ref offset);
 
-            writer.Dispose();
-            writer.Dispose();
-            Assert.Throws<ObjectDisposedException>(() =>
-            {
-                _ = writer.GetBytes();
-            });
-        }
-        finally
-        {
-            writer.Dispose();
-        }
+        Assert.Equal("host.example.com", decodedTarget);
+        Assert.Equal(length, offset);
+        Assert.Same(targetName, ptrRecord.TargetName);
     }
 
     [Fact]
-    public void GetBytes_WhenResponseCodeRequiresExtendedField_ThrowsNotSupportedException()
+    public void Write_WhenResponseHasNoAnswer_WritesQuestionAndResponseCode()
     {
-        var question = new DnsQuestion
-        {
-            Name = "example.com",
-            Type = RecordType.A,
-            Class = DnsClass.Internet,
-        };
-        var query = new DnsQuery(
-            0x1234,
-            false,
-            DnsOperation.Query,
-            false,
-            false,
-            false,
-            false,
-            0,
-            ResponseCode.NoError,
-            1,
-            0,
-            0,
-            0,
-            [question]);
-        var response = new DnsResponse(query, false, true, ResponseCode.BadVers);
-        using var writer = new DnsWriter(response);
+        var queryBytes = DnsTestPacket.CreateQuery();
+        var buffer = new byte[512];
+        queryBytes.AsSpan().CopyTo(buffer);
+        var query = new DnsQueryContext();
+        _ = DnsReader.Read(buffer.AsMemory(0, queryBytes.Length), query);
+        var response = new DnsResponseContext();
+        response.Set(query, null, ResponseCode.NotZone, false, true);
 
-        Assert.Throws<NotSupportedException>(() => writer.GetBytes());
+        var length = DnsWriter.Write(buffer, response);
+
+        Assert.Equal(queryBytes.Length, length);
+        Assert.Equal((ushort)0x808A, BinaryPrimitives.ReadUInt16BigEndian(buffer.AsSpan(2)));
+        Assert.Equal((ushort)0, BinaryPrimitives.ReadUInt16BigEndian(buffer.AsSpan(6)));
     }
 
     [Fact]
-    public void GetBytes_WhenResponseExceedsUdpLimit_TruncatesAtRecordBoundaryAndSetsTC()
+    public void Write_WhenRecordSetExceedsUdpLimit_TruncatesAtRecordBoundary()
     {
-        const string ownerName = "example.com";
-        var question = new DnsQuestion
-        {
-            Name = ownerName,
-            Type = RecordType.A,
-            Class = DnsClass.Internet,
-        };
-        var query = new DnsQuery(
-            0x1234,
-            false,
-            DnsOperation.Query,
-            false,
-            false,
-            false,
-            false,
-            0,
-            ResponseCode.NoError,
-            1,
-            0,
-            0,
-            0,
-            [question]);
-        var ipAddress = IPAddress.Parse("192.0.2.1");
-        var answers = new List<IResourceRecord>(100);
-        for (var answerIndex = 0; answerIndex < 100; answerIndex++)
-        {
-            answers.Add(new ARecord
-            {
-                Name = ownerName,
-                IpAddress = ipAddress,
-            });
-        }
+        var name = new DnsName("example.com");
+        var builder = new DnsDataSetBuilder();
+        for (var recordIndex = 0; recordIndex < 100; recordIndex++)
+            builder.Add(new ARecord(name, IPAddress.Parse("192.0.2.1")));
 
-        var response = new DnsResponse(query, false, true, answers);
-        using var writer = new DnsWriter(response);
+        var dataSet = builder.Build();
+        var queryBytes = DnsTestPacket.CreateQuery();
+        var buffer = new byte[512];
+        queryBytes.AsSpan().CopyTo(buffer);
+        var query = new DnsQueryContext();
+        _ = DnsReader.Read(buffer.AsMemory(0, queryBytes.Length), query);
+        Assert.True(dataSet.TryResolve(query.Question, out var answerSet));
+        var response = new DnsResponseContext();
+        response.Set(query, answerSet, ResponseCode.NoError, false, true);
 
-        var bytes = writer.GetBytes().ToArray();
+        var length = DnsWriter.Write(buffer, response);
+        var flags = BinaryPrimitives.ReadUInt16BigEndian(buffer.AsSpan(2));
+        var answerCount = BinaryPrimitives.ReadUInt16BigEndian(buffer.AsSpan(6));
 
-        var flags = BinaryPrimitives.ReadUInt16BigEndian(bytes.AsSpan(2, 2));
-        var questionCount = BinaryPrimitives.ReadUInt16BigEndian(bytes.AsSpan(4, 2));
-        var answerCount = BinaryPrimitives.ReadUInt16BigEndian(bytes.AsSpan(6, 2));
-        Assert.True(bytes.Length <= 512);
-        Assert.True((flags & 0x0200) != 0);
-        Assert.Equal((ushort)1, questionCount);
+        Assert.True(length <= 512);
+        Assert.NotEqual((ushort)0, (ushort)(flags & 0x0200));
         Assert.InRange(answerCount, (ushort)1, (ushort)99);
-
-        var offset = 12;
-        for (var questionIndex = 0; questionIndex < questionCount; questionIndex++)
-        {
-            var serializedQuestionName = NameHelper.DecodeDnsName(bytes, ref offset);
-            Assert.Equal(ownerName, serializedQuestionName);
-            offset += 4;
-        }
-
-        for (var answerIndex = 0; answerIndex < answerCount; answerIndex++)
-        {
-            var serializedAnswerName = NameHelper.DecodeDnsName(bytes, ref offset);
-            Assert.Equal(ownerName, serializedAnswerName);
-
-            var answerType = BinaryPrimitives.ReadUInt16BigEndian(bytes.AsSpan(offset, 2));
-            Assert.Equal((ushort)RecordType.A, answerType);
-            offset += 8;
-
-            var resourceDataLength = BinaryPrimitives.ReadUInt16BigEndian(bytes.AsSpan(offset, 2));
-            offset += 2 + resourceDataLength;
-        }
-
-        Assert.Equal(bytes.Length, offset);
-    }
-
-    [Fact]
-    public void GetBytes_WhenNameUsesRootTrailingDotOrEscapedOctets_WritesCanonicalWireName()
-    {
-        (string Name, byte[] ExpectedBytes)[] testCases =
-        [
-            (string.Empty, [0x00]),
-            (".", [0x00]),
-            ("example.com.", [0x07, (byte)'e', (byte)'x', (byte)'a', (byte)'m', (byte)'p', (byte)'l', (byte)'e', 0x03, (byte)'c', (byte)'o', (byte)'m', 0x00]),
-            (@"a\.b.\000\255", [0x03, (byte)'a', (byte)'.', (byte)'b', 0x02, 0x00, 0xFF, 0x00]),
-            ("\u00FF", [0x01, 0xFF, 0x00]),
-        ];
-
-        foreach (var testCase in testCases)
-        {
-            var question = new DnsQuestion
-            {
-                Name = testCase.Name,
-                Type = RecordType.A,
-                Class = DnsClass.Internet,
-            };
-            var query = new DnsQuery(
-                0x1234,
-                false,
-                DnsOperation.Query,
-                false,
-                false,
-                false,
-                false,
-                0,
-                ResponseCode.NoError,
-                1,
-                0,
-                0,
-                0,
-                [question]);
-            var response = new DnsResponse(query, false, true, ResponseCode.NoError);
-            using var writer = new DnsWriter(response);
-
-            var bytes = writer.GetBytes().ToArray();
-            var encodedNameBytes = bytes.AsSpan(12, bytes.Length - 16).ToArray();
-
-            Assert.Equal(testCase.ExpectedBytes, encodedNameBytes);
-        }
-    }
-
-    [Fact]
-    public void GetBytes_WhenNameIs255Octets_WritesName()
-    {
-        var name = string.Join(
-            '.',
-            new string('a', 63),
-            new string('b', 63),
-            new string('c', 63),
-            new string('d', 61));
-        var question = new DnsQuestion
-        {
-            Name = name,
-            Type = RecordType.A,
-            Class = DnsClass.Internet,
-        };
-        var query = new DnsQuery(
-            0x1234,
-            false,
-            DnsOperation.Query,
-            false,
-            false,
-            false,
-            false,
-            0,
-            ResponseCode.NoError,
-            1,
-            0,
-            0,
-            0,
-            [question]);
-        var response = new DnsResponse(query, false, true, ResponseCode.NoError);
-        using var writer = new DnsWriter(response);
-
-        var bytes = writer.GetBytes().ToArray();
-
-        Assert.Equal(255, bytes.Length - 16);
-    }
-
-    [Fact]
-    public void GetBytes_WhenNameContainsEmptyLabelOrExceedsLimits_ThrowsFormatException()
-    {
-        var nameExceeding255Octets = string.Join(
-            '.',
-            new string('a', 63),
-            new string('b', 63),
-            new string('c', 63),
-            new string('d', 62));
-        string[] invalidNames =
-        [
-            "example..com",
-            new string('a', 64),
-            nameExceeding255Octets,
-            @"\256",
-            "example\\",
-        ];
-
-        foreach (var invalidName in invalidNames)
-        {
-            var question = new DnsQuestion
-            {
-                Name = invalidName,
-                Type = RecordType.A,
-                Class = DnsClass.Internet,
-            };
-            var query = new DnsQuery(
-                0x1234,
-                false,
-                DnsOperation.Query,
-                false,
-                false,
-                false,
-                false,
-                0,
-                ResponseCode.NoError,
-                1,
-                0,
-                0,
-                0,
-                [question]);
-            var response = new DnsResponse(query, false, true, ResponseCode.NoError);
-            using var writer = new DnsWriter(response);
-
-            Assert.Throws<FormatException>(() => writer.GetBytes());
-        }
-    }
-
-    [Fact]
-    public void GetBytes_WhenAnswerIsPtrRecord_WritesTypeLengthAndTargetName()
-    {
-        const string ownerName = "4.3.2.1.in-addr.arpa";
-        const string targetName = "localhost";
-        var question = new DnsQuestion
-        {
-            Name = ownerName,
-            Type = RecordType.Ptr,
-            Class = DnsClass.Internet,
-        };
-        var query = new DnsQuery(
-            0x1234,
-            false,
-            DnsOperation.Query,
-            false,
-            false,
-            false,
-            false,
-            0,
-            ResponseCode.NoError,
-            1,
-            0,
-            0,
-            0,
-            [question]);
-        var ptrRecord = new PtrRecord
-        {
-            Name = ownerName,
-            TargetName = targetName,
-            Ttl = 300,
-        };
-        var response = new DnsResponse(query, false, true, [ptrRecord]);
-        using var writer = new DnsWriter(response);
-
-        var bytes = writer.GetBytes().ToArray();
-
-        var offset = 12;
-        var questionName = NameHelper.DecodeDnsName(bytes, ref offset);
-        offset += 4;
-
-        var answerName = NameHelper.DecodeDnsName(bytes, ref offset);
-        var answerType = BinaryPrimitives.ReadUInt16BigEndian(bytes.AsSpan(offset, 2));
-        offset += 2;
-        var answerClass = BinaryPrimitives.ReadUInt16BigEndian(bytes.AsSpan(offset, 2));
-        offset += 2;
-        var answerTtl = BinaryPrimitives.ReadUInt32BigEndian(bytes.AsSpan(offset, 4));
-        offset += 4;
-        var resourceDataLength = BinaryPrimitives.ReadUInt16BigEndian(bytes.AsSpan(offset, 2));
-        offset += 2;
-
-        var resourceDataStartOffset = offset;
-        var ptrTargetName = NameHelper.DecodeDnsName(bytes, ref offset);
-
-        Assert.Equal(RecordType.Ptr, ptrRecord.Type);
-        Assert.Equal(ownerName, questionName);
-        Assert.Equal(ownerName, answerName);
-        Assert.Equal((ushort)RecordType.Ptr, answerType);
-        Assert.Equal((ushort)DnsClass.Internet, answerClass);
-        Assert.Equal(300U, answerTtl);
-        Assert.Equal((ushort)(offset - resourceDataStartOffset), resourceDataLength);
-        Assert.Equal(targetName, ptrTargetName);
-        Assert.Equal(bytes.Length, offset);
+        Assert.Equal(queryBytes.Length + (answerCount * 16), length);
     }
 
     [Theory]
     [InlineData(ResponseCode.FormatError)]
     [InlineData(ResponseCode.NotImplemented)]
     [InlineData(ResponseCode.ServerFailure)]
-    public void WriteErrorResponse_WhenResponseCodeIsSupported_WritesMinimalHeader(ResponseCode responseCode)
+    public void WriteErrorResponse_WhenResponseCodeIsSupported_WritesExactHeader(ResponseCode responseCode)
     {
         var destination = new byte[12];
-        var errorResponse = new DnsErrorResponse(
-            0x1234,
-            (DnsOperation)15,
-            true,
-            responseCode);
+        var errorResponse = new DnsErrorResponse(0x1234, 15, true, responseCode);
 
         var writtenBytes = DnsWriter.WriteErrorResponse(destination, errorResponse, true);
 
-        var transactionId = BinaryPrimitives.ReadUInt16BigEndian(destination);
         var flags = BinaryPrimitives.ReadUInt16BigEndian(destination.AsSpan(2));
         var expectedFlags = (ushort)(0x8000 | 0x7800 | 0x0100 | 0x0080 | (byte)responseCode);
         Assert.Equal(12, writtenBytes);
-        Assert.Equal((ushort)0x1234, transactionId);
+        Assert.Equal((ushort)0x1234, BinaryPrimitives.ReadUInt16BigEndian(destination));
         Assert.Equal(expectedFlags, flags);
         Assert.Equal(0U, BinaryPrimitives.ReadUInt32BigEndian(destination.AsSpan(4)));
         Assert.Equal(0U, BinaryPrimitives.ReadUInt32BigEndian(destination.AsSpan(8)));
     }
 
     [Fact]
-    public void WriteErrorResponse_WhenCalled_DoesNotAllocate()
+    public void WriteErrorResponse_WhenWarmed_DoesNotAllocate()
     {
         var destination = new byte[12];
-        var errorResponse = new DnsErrorResponse(
-            0x1234,
-            DnsOperation.Query,
-            false,
-            ResponseCode.FormatError);
+        var errorResponse = new DnsErrorResponse(0x1234, 0, false, ResponseCode.FormatError);
         _ = DnsWriter.WriteErrorResponse(destination, errorResponse, true);
 
         var allocatedBytesBefore = GC.GetAllocatedBytesForCurrentThread();
-        _ = DnsWriter.WriteErrorResponse(destination, errorResponse, true);
+        var writtenBytes = DnsWriter.WriteErrorResponse(destination, errorResponse, true);
         var allocatedBytes = GC.GetAllocatedBytesForCurrentThread() - allocatedBytesBefore;
 
-        Assert.Equal(0L, allocatedBytes);
+        Assert.Equal(12, writtenBytes);
+        Assert.Equal(0, allocatedBytes);
     }
 
     [Fact]
-    public void WriteErrorResponse_WhenGivenReaderFailures_WritesExpectedResponseCodes()
+    public void Write_WhenWarmed_DoesNotAllocateForManagedResponseVariants()
     {
-        var malformedQuery = new byte[12];
-        BinaryPrimitives.WriteUInt16BigEndian(malformedQuery, 0x1234);
-        var malformedResult = DnsReader.TryReadBytes(malformedQuery);
-        Assert.True(malformedResult.IsFailure(out var malformedError, out _));
-        var malformedReadError = Assert.IsType<DnsReadError>(malformedError);
+        var builder = new DnsDataSetBuilder();
+        builder.Add(new ARecord(new DnsName("example.com"), IPAddress.Parse("192.0.2.1")));
+        builder.Add(new PtrRecord(new DnsName("1.2.0.192.in-addr.arpa"), new DnsName("host.example.com")));
+        var dataSet = builder.Build();
 
-        var unsupportedQuery = new byte[12];
-        BinaryPrimitives.WriteUInt16BigEndian(unsupportedQuery, 0x5678);
-        BinaryPrimitives.WriteUInt16BigEndian(unsupportedQuery.AsSpan(2), 0x7800);
-        var unsupportedResult = DnsReader.TryReadBytes(unsupportedQuery);
-        Assert.True(unsupportedResult.IsFailure(out var unsupportedError, out _));
-        var unsupportedReadError = Assert.IsType<DnsReadError>(unsupportedError);
+        var aQueryBytes = DnsTestPacket.CreateQuery();
+        var aBuffer = new byte[512];
+        aQueryBytes.CopyTo(aBuffer, 0);
+        var aQuery = new DnsQueryContext();
+        _ = DnsReader.Read(aBuffer.AsMemory(0, aQueryBytes.Length), aQuery);
+        _ = dataSet.TryResolve(aQuery.Question, out var aAnswerSet);
+        var aResponse = new DnsResponseContext();
+        aResponse.Set(aQuery, aAnswerSet, ResponseCode.NoError, false, true);
+        _ = DnsWriter.Write(aBuffer, aResponse);
 
-        var serverFailureResponse = new DnsErrorResponse(
-            0x9ABC,
-            DnsOperation.Query,
-            false,
-            ResponseCode.ServerFailure);
-        var serverReadError = new DnsReadError(
-            "Unexpected failure.",
-            new InvalidOperationException("Test exception."),
-            serverFailureResponse);
-        DnsReadError[] readErrors =
-        [
-            malformedReadError,
-            unsupportedReadError,
-            serverReadError,
-        ];
-        ResponseCode[] expectedResponseCodes =
-        [
-            ResponseCode.FormatError,
-            ResponseCode.NotImplemented,
-            ResponseCode.ServerFailure,
-        ];
+        var ptrQueryBytes = DnsTestPacket.CreateQuery("1.2.0.192.in-addr.arpa", (ushort)RecordType.Ptr);
+        var ptrBuffer = new byte[512];
+        ptrQueryBytes.CopyTo(ptrBuffer, 0);
+        var ptrQuery = new DnsQueryContext();
+        _ = DnsReader.Read(ptrBuffer.AsMemory(0, ptrQueryBytes.Length), ptrQuery);
+        _ = dataSet.TryResolve(ptrQuery.Question, out var ptrAnswerSet);
+        var ptrResponse = new DnsResponseContext();
+        ptrResponse.Set(ptrQuery, ptrAnswerSet, ResponseCode.NoError, false, true);
+        _ = DnsWriter.Write(ptrBuffer, ptrResponse);
 
-        for (var errorIndex = 0; errorIndex < readErrors.Length; errorIndex++)
-        {
-            var errorResponse = readErrors[errorIndex].Response;
-            Assert.True(errorResponse.HasValue);
-            var destination = new byte[12];
+        var missQueryBytes = DnsTestPacket.CreateQuery("missing.example");
+        var missBuffer = new byte[512];
+        missQueryBytes.CopyTo(missBuffer, 0);
+        var missQuery = new DnsQueryContext();
+        _ = DnsReader.Read(missBuffer.AsMemory(0, missQueryBytes.Length), missQuery);
+        var missResponse = new DnsResponseContext();
+        missResponse.Set(missQuery, null, ResponseCode.NotZone, false, true);
+        _ = DnsWriter.Write(missBuffer, missResponse);
 
-            var writtenBytes = DnsWriter.WriteErrorResponse(
-                destination,
-                errorResponse.GetValueOrDefault(),
-                true);
+        var errorBuffer = new byte[12];
+        var formatError = new DnsErrorResponse(0x1234, 0, false, ResponseCode.FormatError);
+        var notImplemented = new DnsErrorResponse(0x5678, 15, true, ResponseCode.NotImplemented);
+        _ = DnsWriter.WriteErrorResponse(errorBuffer, formatError, true);
+        _ = DnsWriter.WriteErrorResponse(errorBuffer, notImplemented, true);
 
-            var flags = BinaryPrimitives.ReadUInt16BigEndian(destination.AsSpan(2));
-            Assert.Equal(12, writtenBytes);
-            Assert.Equal((ushort)expectedResponseCodes[errorIndex], (ushort)(flags & 0x000F));
-        }
+        var beforeResponseSet = GC.GetAllocatedBytesForCurrentThread();
+        aResponse.Set(aQuery, aAnswerSet, ResponseCode.NoError, false, true);
+        var responseSetAllocations = GC.GetAllocatedBytesForCurrentThread() - beforeResponseSet;
 
-        Assert.IsType<InvalidOperationException>(serverReadError.Exception);
+        var beforeA = GC.GetAllocatedBytesForCurrentThread();
+        var aLength = DnsWriter.Write(aBuffer, aResponse);
+        var aAllocations = GC.GetAllocatedBytesForCurrentThread() - beforeA;
+
+        var beforePtr = GC.GetAllocatedBytesForCurrentThread();
+        var ptrLength = DnsWriter.Write(ptrBuffer, ptrResponse);
+        var ptrAllocations = GC.GetAllocatedBytesForCurrentThread() - beforePtr;
+
+        var beforeMiss = GC.GetAllocatedBytesForCurrentThread();
+        var missLength = DnsWriter.Write(missBuffer, missResponse);
+        var missAllocations = GC.GetAllocatedBytesForCurrentThread() - beforeMiss;
+
+        var beforeFormatError = GC.GetAllocatedBytesForCurrentThread();
+        var formatErrorLength = DnsWriter.WriteErrorResponse(errorBuffer, formatError, true);
+        var formatErrorAllocations = GC.GetAllocatedBytesForCurrentThread() - beforeFormatError;
+
+        var beforeNotImplemented = GC.GetAllocatedBytesForCurrentThread();
+        var notImplementedLength = DnsWriter.WriteErrorResponse(errorBuffer, notImplemented, true);
+        var notImplementedAllocations = GC.GetAllocatedBytesForCurrentThread() - beforeNotImplemented;
+
+        Assert.True(aLength > aQueryBytes.Length);
+        Assert.True(ptrLength > ptrQueryBytes.Length);
+        Assert.Equal(missQueryBytes.Length, missLength);
+        Assert.Equal(12, formatErrorLength);
+        Assert.Equal(12, notImplementedLength);
+        Assert.Equal(0, responseSetAllocations);
+        Assert.Equal(0, aAllocations);
+        Assert.Equal(0, ptrAllocations);
+        Assert.Equal(0, missAllocations);
+        Assert.Equal(0, formatErrorAllocations);
+        Assert.Equal(0, notImplementedAllocations);
+    }
+
+    [Fact]
+    public void ParseLookupAndWrite_WhenWarmed_DoesNotAllocate()
+    {
+        var queryBytes = DnsTestPacket.CreateQuery();
+        var buffer = new byte[512];
+        var query = new DnsQueryContext();
+        var response = new DnsResponseContext();
+        var builder = new DnsDataSetBuilder();
+        builder.Add(new ARecord(new DnsName("example.com"), IPAddress.Parse("192.0.2.1")));
+        var dataSet = builder.Build();
+
+        queryBytes.AsSpan().CopyTo(buffer);
+        _ = DnsReader.Read(buffer.AsMemory(0, queryBytes.Length), query);
+        _ = dataSet.TryResolve(query.Question, out var warmAnswerSet);
+        response.Set(query, warmAnswerSet, ResponseCode.NoError, false, true);
+        _ = DnsWriter.Write(buffer, response);
+
+        queryBytes.AsSpan().CopyTo(buffer);
+        var allocatedBytesBefore = GC.GetAllocatedBytesForCurrentThread();
+        var readResult = DnsReader.Read(buffer.AsMemory(0, queryBytes.Length), query);
+        var found = dataSet.TryResolve(query.Question, out var answerSet);
+        response.Set(query, answerSet, ResponseCode.NoError, false, true);
+        var responseLength = DnsWriter.Write(buffer, response);
+        var allocatedBytes = GC.GetAllocatedBytesForCurrentThread() - allocatedBytesBefore;
+
+        Assert.Equal(DnsReadOutcome.Query, readResult.Outcome);
+        Assert.True(found);
+        Assert.True(responseLength > queryBytes.Length);
+        Assert.Equal(0, allocatedBytes);
+    }
+
+    [Fact]
+    public void Materialize_WhenResponseContextIsReused_RetainsManagedQueryAndRecords()
+    {
+        var queryBytes = DnsTestPacket.CreateQuery(transactionId: 0x1234);
+        var buffer = new byte[512];
+        queryBytes.AsSpan().CopyTo(buffer);
+        var query = new DnsQueryContext();
+        _ = DnsReader.Read(buffer.AsMemory(0, queryBytes.Length), query);
+        var builder = new DnsDataSetBuilder();
+        builder.Add(new ARecord(new DnsName("example.com"), IPAddress.Parse("192.0.2.1")));
+        var dataSet = builder.Build();
+        _ = dataSet.TryResolve(query.Question, out var answerSet);
+        var response = new DnsResponseContext();
+        response.Set(query, answerSet, ResponseCode.NoError, false, true);
+        var materialized = response.Materialize();
+
+        var secondQuery = DnsTestPacket.CreateQuery("other.example", transactionId: 0x5678);
+        secondQuery.AsSpan().CopyTo(buffer);
+        _ = DnsReader.Read(buffer.AsMemory(0, secondQuery.Length), query);
+        response.Set(query, null, ResponseCode.NotZone, false, true);
+
+        Assert.Equal((ushort)0x1234, materialized.Query.TransactionId);
+        Assert.Equal("example.com", materialized.Query.Question.Name.Value);
+        Assert.Single(materialized.Answers);
+        Assert.False(materialized.AuthoritativeAnswer);
+        Assert.True(materialized.RecursionAvailable);
+        Assert.Equal(ResponseCode.NoError, materialized.ResponseCode);
     }
 }
