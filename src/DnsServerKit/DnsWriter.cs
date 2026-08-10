@@ -11,7 +11,7 @@ namespace DnsServerKit;
 [MustDisposeResource]
 public sealed class DnsWriter(DnsResponse dnsResponse) : IDisposable
 {
-    private readonly Dictionary<string, int> _namePositions = new();
+    private readonly Dictionary<string, int> _namePositions = new(StringComparer.Ordinal);
     private byte[]? _bytes;
 
     public ReadOnlyMemory<byte> GetBytes()
@@ -156,11 +156,104 @@ public sealed class DnsWriter(DnsResponse dnsResponse) : IDisposable
 
     private void WriteName(MemoryStream memoryStream, string name)
     {
-        var labels = name.Split('.');
-        for (var i = 0; i < labels.Length; i++)
+        ArgumentNullException.ThrowIfNull(name);
+
+        if (name.Length == 0 || name.Equals(".", StringComparison.Ordinal))
         {
-            var label = string.Join('.', labels.Skip(i));
-            if (_namePositions.TryGetValue(label, out var position))
+            memoryStream.WriteByte(0);
+            return;
+        }
+
+        var labels = new List<byte[]>();
+        var currentLabelBytes = new List<byte>(Math.Min(name.Length, 63));
+        var characterIndex = 0;
+        while (characterIndex < name.Length)
+        {
+            var character = name[characterIndex];
+            if (character == '.')
+            {
+                if (currentLabelBytes.Count == 0)
+                    throw new FormatException("A DNS name cannot contain an empty label.");
+
+                labels.Add(currentLabelBytes.ToArray());
+                currentLabelBytes.Clear();
+                characterIndex++;
+                continue;
+            }
+
+            byte labelByte;
+            if (character == '\\')
+            {
+                characterIndex++;
+                if (characterIndex >= name.Length)
+                    throw new FormatException("A DNS name cannot end with an incomplete escape sequence.");
+
+                var escapedCharacter = name[characterIndex];
+                if (escapedCharacter is >= '0' and <= '9')
+                {
+                    if (characterIndex + 2 >= name.Length
+                        || name[characterIndex + 1] is < '0' or > '9'
+                        || name[characterIndex + 2] is < '0' or > '9')
+                    {
+                        throw new FormatException("A numeric DNS name escape must contain exactly three decimal digits.");
+                    }
+
+                    var escapedOctet = ((escapedCharacter - '0') * 100)
+                                       + ((name[characterIndex + 1] - '0') * 10)
+                                       + (name[characterIndex + 2] - '0');
+                    if (escapedOctet > byte.MaxValue)
+                        throw new FormatException("A numeric DNS name escape cannot exceed 255.");
+
+                    labelByte = (byte)escapedOctet;
+                    characterIndex += 3;
+                }
+                else
+                {
+                    if (escapedCharacter > byte.MaxValue)
+                        throw new FormatException("A DNS label character cannot exceed one octet.");
+
+                    labelByte = (byte)escapedCharacter;
+                    characterIndex++;
+                }
+            }
+            else
+            {
+                if (character > byte.MaxValue)
+                    throw new FormatException("A DNS label character cannot exceed one octet.");
+
+                labelByte = (byte)character;
+                characterIndex++;
+            }
+
+            currentLabelBytes.Add(labelByte);
+            if (currentLabelBytes.Count > 63)
+                throw new FormatException("A DNS label cannot exceed 63 octets.");
+        }
+
+        if (currentLabelBytes.Count > 0)
+            labels.Add(currentLabelBytes.ToArray());
+
+        var uncompressedNameLength = 1;
+        foreach (var labelBytes in labels)
+        {
+            uncompressedNameLength += labelBytes.Length + 1;
+            if (uncompressedNameLength > 255)
+                throw new FormatException("A DNS name cannot exceed 255 octets.");
+        }
+
+        for (var i = 0; i < labels.Count; i++)
+        {
+            var suffixKeyBuilder = new StringBuilder();
+            for (var suffixIndex = i; suffixIndex < labels.Count; suffixIndex++)
+            {
+                var suffixLabelBytes = labels[suffixIndex];
+                suffixKeyBuilder.Append((char)suffixLabelBytes.Length);
+                foreach (var suffixLabelByte in suffixLabelBytes)
+                    suffixKeyBuilder.Append((char)suffixLabelByte);
+            }
+
+            var suffixKey = suffixKeyBuilder.ToString();
+            if (_namePositions.TryGetValue(suffixKey, out var position) && position <= 0x3FFF)
             {
                 // Write pointer to the existing label
                 var pointer = (ushort)(0xC000 | position);
@@ -170,12 +263,13 @@ public sealed class DnsWriter(DnsResponse dnsResponse) : IDisposable
                 ArrayPool<byte>.Shared.Return(pointerBytes);
                 return;
             }
+
             // Write the label length and content
-            var labelBytes = Encoding.ASCII.GetBytes(labels[i]);
+            var labelBytes = labels[i];
             memoryStream.WriteByte((byte)labelBytes.Length);
             memoryStream.Write(labelBytes);
             // Store position of this label
-            _namePositions[label] = (int)memoryStream.Position - labelBytes.Length - 1;
+            _namePositions[suffixKey] = (int)memoryStream.Position - labelBytes.Length - 1;
         }
         // Write the final zero byte
         memoryStream.WriteByte(0);
