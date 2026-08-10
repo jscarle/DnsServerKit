@@ -70,7 +70,8 @@ public sealed class DnsServer(IMemoryCache memoryCache, ILogger<DnsServer> logge
             try
             {
                 var receiveResult = await _udpSocket.ReceiveFromAsync(receiveBuffer, SocketFlags.None, remoteEndpoint, cancellationToken);
-                if (DnsReader.TryReadBytes(receiveBuffer).IsFailure(out var error, out var dnsQuery))
+                var receivedDatagram = receiveBuffer[..receiveResult.ReceivedBytes];
+                if (DnsReader.TryReadBytes(receivedDatagram).IsFailure(out var error, out var dnsQuery))
                 {
                     logger.LogError("{Error}", error.Message);
                     continue;
