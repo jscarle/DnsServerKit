@@ -11,6 +11,107 @@ namespace DnsServerKit.Tests;
 public sealed class DnsWriterTests
 {
     [Fact]
+    public void ARecord_WhenAddressIsIPv6_ThrowsArgumentException()
+    {
+        Assert.Throws<ArgumentException>(() =>
+        {
+            _ = new ARecord
+            {
+                Name = "example.com",
+                IpAddress = IPAddress.IPv6Loopback,
+            };
+        });
+    }
+
+    [Fact]
+    public void GetBytesAndDispose_WhenCalledTwice_AreIdempotent()
+    {
+        const string ownerName = "example.com";
+        var question = new DnsQuestion
+        {
+            Name = ownerName,
+            Type = RecordType.A,
+            Class = DnsClass.Internet,
+        };
+        var query = new DnsQuery(
+            0x1234,
+            false,
+            DnsOperation.Query,
+            false,
+            false,
+            false,
+            false,
+            0,
+            ResponseCode.NoError,
+            1,
+            0,
+            0,
+            0,
+            [question]);
+        var answer = new ARecord
+        {
+            Name = ownerName,
+            IpAddress = IPAddress.Parse("192.0.2.1"),
+        };
+        var response = new DnsResponse(query, false, true, [answer]);
+        var writer = new DnsWriter(response);
+        try
+        {
+            var firstBytes = writer.GetBytes().ToArray();
+            var secondBytes = writer.GetBytes().ToArray();
+
+            Assert.Equal(firstBytes, secondBytes);
+            var offset = 12;
+            var questionName = NameHelper.DecodeDnsName(secondBytes, ref offset);
+            offset += 4;
+            var answerName = NameHelper.DecodeDnsName(secondBytes, ref offset);
+            Assert.Equal(ownerName, questionName);
+            Assert.Equal(ownerName, answerName);
+
+            writer.Dispose();
+            writer.Dispose();
+            Assert.Throws<ObjectDisposedException>(() =>
+            {
+                _ = writer.GetBytes();
+            });
+        }
+        finally
+        {
+            writer.Dispose();
+        }
+    }
+
+    [Fact]
+    public void GetBytes_WhenResponseCodeRequiresExtendedField_ThrowsNotSupportedException()
+    {
+        var question = new DnsQuestion
+        {
+            Name = "example.com",
+            Type = RecordType.A,
+            Class = DnsClass.Internet,
+        };
+        var query = new DnsQuery(
+            0x1234,
+            false,
+            DnsOperation.Query,
+            false,
+            false,
+            false,
+            false,
+            0,
+            ResponseCode.NoError,
+            1,
+            0,
+            0,
+            0,
+            [question]);
+        var response = new DnsResponse(query, false, true, ResponseCode.BadVers);
+        using var writer = new DnsWriter(response);
+
+        Assert.Throws<NotSupportedException>(() => writer.GetBytes());
+    }
+
+    [Fact]
     public void GetBytes_WhenResponseExceedsUdpLimit_TruncatesAtRecordBoundaryAndSetsTC()
     {
         const string ownerName = "example.com";

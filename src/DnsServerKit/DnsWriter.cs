@@ -14,9 +14,21 @@ public sealed class DnsWriter(DnsResponse dnsResponse) : IDisposable
     private const int MaximumUdpMessageLength = 512;
     private readonly Dictionary<string, int> _namePositions = new(StringComparer.Ordinal);
     private byte[]? _bytes;
+    private int _length;
+    private bool _disposed;
 
     public ReadOnlyMemory<byte> GetBytes()
     {
+        if (_disposed)
+            throw new ObjectDisposedException(nameof(DnsWriter));
+
+        if (_bytes is not null)
+            return new ReadOnlyMemory<byte>(_bytes, 0, _length);
+
+        if ((byte)dnsResponse.RCode > 0x0F)
+            throw new NotSupportedException("Extended DNS response codes require an OPT record and are not supported by this writer.");
+
+        _namePositions.Clear();
         using var memoryStream = new MemoryStream(MaximumUdpMessageLength);
 
         WriteHeader(memoryStream, dnsResponse, dnsResponse.TC, dnsResponse.QDCount, dnsResponse.ANCount);
@@ -324,6 +336,7 @@ public sealed class DnsWriter(DnsResponse dnsResponse) : IDisposable
         var length = (int)memoryStream.Position;
         
         _bytes = ArrayPool<byte>.Shared.Rent(length);
+        _length = length;
         
         memoryStream.Position = 0;
         memoryStream.ReadExactly(_bytes, 0, length);
@@ -335,7 +348,14 @@ public sealed class DnsWriter(DnsResponse dnsResponse) : IDisposable
 
     public void Dispose()
     {
-        if (_bytes is not null) 
+        if (_disposed)
+            return;
+
+        _disposed = true;
+        if (_bytes is not null)
+        {
             ArrayPool<byte>.Shared.Return(_bytes);
+            _bytes = null;
+        }
     }
 }
