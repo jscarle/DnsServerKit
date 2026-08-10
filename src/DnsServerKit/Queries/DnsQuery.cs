@@ -1,4 +1,5 @@
 ﻿using DnsServerKit.Parameters;
+// ReSharper disable InconsistentNaming
 
 namespace DnsServerKit.Queries;
 

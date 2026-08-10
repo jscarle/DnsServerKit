@@ -9,30 +9,24 @@ using JetBrains.Annotations;
 namespace DnsServerKit;
 
 [MustDisposeResource]
-public sealed class DnsWriter : IDisposable
+public sealed class DnsWriter(DnsResponse dnsResponse) : IDisposable
 {
-    private readonly DnsResponse _dnsResponse;
     private readonly Dictionary<string, int> _namePositions = new();
-    private byte[] _bytes;
-
-    public DnsWriter(DnsResponse dnsResponse)
-    {
-        _dnsResponse = dnsResponse;
-    }
+    private byte[]? _bytes;
 
     public ReadOnlyMemory<byte> GetBytes()
     {
         using var memoryStream = new MemoryStream(512);
 
-        WriteHeader(memoryStream, _dnsResponse);
+        WriteHeader(memoryStream, dnsResponse);
 
-        foreach (var question in _dnsResponse.Questions)
+        foreach (var question in dnsResponse.Questions)
         {
             WriteName(memoryStream, question.Name);
             WriteQuestion(memoryStream, question);
         }
 
-        foreach (var answer in _dnsResponse.Answers)
+        foreach (var answer in dnsResponse.Answers)
         {
             WriteName(memoryStream, answer.Name);
             WriteAnswer(memoryStream, answer);
@@ -188,6 +182,7 @@ public sealed class DnsWriter : IDisposable
 
     public void Dispose()
     {
-        ArrayPool<byte>.Shared.Return(_bytes);
+        if (_bytes is not null) 
+            ArrayPool<byte>.Shared.Return(_bytes);
     }
 }

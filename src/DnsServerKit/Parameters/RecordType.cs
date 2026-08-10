@@ -1,4 +1,5 @@
-﻿namespace DnsServerKit.Parameters;
+﻿// ReSharper disable InconsistentNaming
+namespace DnsServerKit.Parameters;
 
 /// <summary><c>Resource Record (RR) TYPEs</c> Represents the resource record types for DNS messages.</summary>
 public enum RecordType : ushort

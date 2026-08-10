@@ -1,6 +1,7 @@
 ﻿using DnsServerKit.Parameters;
 using DnsServerKit.Queries;
 using DnsServerKit.ResourceRecords;
+// ReSharper disable InconsistentNaming
 
 namespace DnsServerKit.Responses;
 

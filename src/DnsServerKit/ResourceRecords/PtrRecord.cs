@@ -1,5 +1,4 @@
-﻿using System.Net;
-using DnsServerKit.Parameters;
+﻿using DnsServerKit.Parameters;
 
 namespace DnsServerKit.ResourceRecords;
 

@@ -13,19 +13,12 @@ using Microsoft.Extensions.Logging;
 
 namespace DnsServerKit;
 
-public sealed class DnsServer : IHostedService, IAsyncDisposable
+public sealed class DnsServer(IMemoryCache memoryCache, ILogger<DnsServer> logger) : IHostedService, IAsyncDisposable
 {
-    private readonly IMemoryCache _memoryCache;
-    private readonly ILogger<DnsServer> _logger;
+    private readonly IMemoryCache _memoryCache = memoryCache;
     private CancellationTokenSource? _cts;
     private Socket? _udpSocket;
     private Task? _listeningTask;
-
-    public DnsServer(IMemoryCache memoryCache, ILogger<DnsServer> logger)
-    {
-        _memoryCache = memoryCache;
-        _logger = logger;
-    }
 
     public Task StartAsync(CancellationToken cancellationToken)
     {
@@ -65,7 +58,7 @@ public sealed class DnsServer : IHostedService, IAsyncDisposable
     {
         Debug.Assert(_udpSocket is not null);
 
-        _logger.LogInformation("Starting to listen...");
+        logger.LogInformation("Starting to listen...");
 
         var remoteEndpoint = new IPEndPoint(IPAddress.Any, 0);
 
@@ -77,13 +70,13 @@ public sealed class DnsServer : IHostedService, IAsyncDisposable
             try
             {
                 var receiveResult = await _udpSocket.ReceiveFromAsync(receiveBuffer, SocketFlags.None, remoteEndpoint, cancellationToken);
-                if (DnsReader.TryReadBytes(receiveBuffer).IsFailed(out var error, out var dnsQuery))
+                if (DnsReader.TryReadBytes(receiveBuffer).IsFailure(out var error, out var dnsQuery))
                 {
-                    _logger.LogError("{Error}", error.Message);
+                    logger.LogError("{Error}", error.Message);
                     continue;
                 }
                 
-                //LogQuery(receiveResult.ReceivedBytes, dnsQuery);
+                LogQuery(receiveResult.ReceivedBytes, dnsQuery);
 
                 var dnsResponse = CreateDnsResponse(dnsQuery);
                 
@@ -92,7 +85,7 @@ public sealed class DnsServer : IHostedService, IAsyncDisposable
                 using var dnsWriter = new DnsWriter(dnsResponse);
                 var sendBuffer = dnsWriter.GetBytes();
                 var sentBytes = await _udpSocket.SendToAsync(sendBuffer, SocketFlags.None, receiveResult.RemoteEndPoint, cancellationToken);
-                //LogResponse(sentBytes, dnsResponse);
+                LogResponse(sentBytes, dnsResponse);
             }
             catch (OperationCanceledException)
             {
@@ -100,7 +93,7 @@ public sealed class DnsServer : IHostedService, IAsyncDisposable
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "An exception occured while processing the DNS request.");
+                logger.LogError(ex, "An exception occured while processing the DNS request.");
             }
         }
     }
@@ -143,7 +136,7 @@ public sealed class DnsServer : IHostedService, IAsyncDisposable
         log.AppendLine($"{dnsQuery}");
         foreach(var question in dnsQuery.Questions)
             log.AppendLine($" - {question}");
-        _logger.LogInformation("{Message}", log.ToString());
+        logger.LogInformation("{Message}", log.ToString());
     }
 
     private void LogResponse(int receivedBytes, DnsResponse dnsResponse)
@@ -153,6 +146,6 @@ public sealed class DnsServer : IHostedService, IAsyncDisposable
         log.AppendLine($"{dnsResponse}");
         foreach(var answer in dnsResponse.Answers)
             log.AppendLine($" - {answer}");
-        _logger.LogInformation("{Message}", log.ToString());
+        logger.LogInformation("{Message}", log.ToString());
     }
 }
