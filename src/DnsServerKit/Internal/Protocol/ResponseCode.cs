@@ -1,7 +1,7 @@
 ﻿namespace DnsServerKit.Internal.Protocol;
 
 /// <summary><c>DNS RCODEs</c> Represents the response codes for DNS messages.</summary>
-internal enum ResponseCode : byte
+internal enum ResponseCode : ushort
 {
     /// <summary><c>NoError</c> Represents a no error response.</summary>
     NoError = 0,

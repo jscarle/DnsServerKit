@@ -20,7 +20,7 @@ internal sealed class DnsResponseContext
     public void Set(DnsQueryContext query, RecordSet? answerSet, ResponseCode responseCode, bool authoritativeAnswer, bool recursionAvailable)
     {
         ArgumentNullException.ThrowIfNull(query);
-        if ((byte)responseCode > 0x0F)
+        if ((ushort)responseCode > 0x0F)
             throw new NotSupportedException("Extended DNS response codes require an OPT record and are not supported.");
 
         Query = query;

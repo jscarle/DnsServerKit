@@ -12,6 +12,13 @@ public sealed class DnsZoneBuilderTests
     public void Build_WhenConvenienceMethodsAreUsed_CreatesTypedRecordSetModels()
     {
         var nameServers = new List<string> { "ns1.example.com", "ns2.example.com" };
+        var ipv6Addresses = new List<string> { "2001:db8::1", "2001:db8::2" };
+        var mailExchanges = new List<MxRecord>
+        {
+            new() { Preference = 10, Exchange = "mail1.example.com" },
+            new() { Preference = 20, Exchange = "mail2.example.com" },
+        };
+        var texts = new List<string> { "v=spf1 -all", "site-verification" };
         var pointerTargets = new List<string> { "target1.example.com", "target2.example.com" };
         var builder = new DnsZoneBuilder("example.com");
         builder.AddSoaRecord(
@@ -25,22 +32,40 @@ public sealed class DnsZoneBuilderTests
             300);
         builder.AddNsRecord(600, nameServers);
         builder.AddARecord(0, "@", "192.0.2.1", "192.0.2.2");
+        builder.AddAaaaRecord(120, "ipv6", ipv6Addresses);
+        builder.AddCnameRecord(180, "alias", "target.example.com");
+        builder.AddMxRecord(240, "@", mailExchanges);
+        builder.AddTxtRecord(300, "@", texts);
         builder.AddPtrRecord(60, "pointer", pointerTargets);
 
         nameServers.Add("ns3.example.com");
+        ipv6Addresses.Clear();
+        mailExchanges.Clear();
+        texts.Clear();
         pointerTargets.Clear();
         var zone = builder.Build();
 
         var startOfAuthorityRecordSet = Assert.IsType<SoaRecordSet>(zone.RecordSets.ElementAt(0));
         var nameServerRecordSet = Assert.IsType<NsRecordSet>(zone.RecordSets.ElementAt(1));
         var addressRecordSet = Assert.IsType<ARecordSet>(zone.RecordSets.ElementAt(2));
-        var pointerRecordSet = Assert.IsType<PtrRecordSet>(zone.RecordSets.ElementAt(3));
+        var ipv6AddressRecordSet = Assert.IsType<AaaaRecordSet>(zone.RecordSets.ElementAt(3));
+        var canonicalNameRecordSet = Assert.IsType<CnameRecordSet>(zone.RecordSets.ElementAt(4));
+        var mailExchangeRecordSet = Assert.IsType<MxRecordSet>(zone.RecordSets.ElementAt(5));
+        var textRecordSet = Assert.IsType<TxtRecordSet>(zone.RecordSets.ElementAt(6));
+        var pointerRecordSet = Assert.IsType<PtrRecordSet>(zone.RecordSets.ElementAt(7));
         Assert.Equal(300U, startOfAuthorityRecordSet.Ttl);
         Assert.Equal("hostmaster@example.com", startOfAuthorityRecordSet.Record.ResponsibleMailbox);
         Assert.Equal(600U, nameServerRecordSet.Ttl);
         Assert.Equal(2, nameServerRecordSet.Count);
         Assert.Equal(0U, addressRecordSet.Ttl);
         Assert.Equal(2, addressRecordSet.Count);
+        Assert.Equal(2, ipv6AddressRecordSet.Count);
+        Assert.Equal("2001:0db8:0000:0000:0000:0000:0000:0001", ipv6AddressRecordSet.Records.First().Address);
+        Assert.Equal("target.example.com", canonicalNameRecordSet.Record.Target);
+        Assert.Equal(2, mailExchangeRecordSet.Count);
+        Assert.Equal(10, mailExchangeRecordSet.Records.First().Preference);
+        Assert.Equal(2, textRecordSet.Count);
+        Assert.Equal("v=spf1 -all", textRecordSet.Records.First().Text);
         Assert.Equal(60U, pointerRecordSet.Ttl);
         Assert.Equal(2, pointerRecordSet.Count);
     }
@@ -54,6 +79,30 @@ public sealed class DnsZoneBuilderTests
             Name = "@",
             Ttl = 300,
             Records = [new ARecord { Address = "192.0.2.1" }],
+        });
+        builder.AddRecordSet(new AaaaRecordSet
+        {
+            Name = "ipv6",
+            Ttl = 300,
+            Records = [new AaaaRecord { Address = "2001:db8::1" }],
+        });
+        builder.AddRecordSet(new CnameRecordSet
+        {
+            Name = "alias",
+            Ttl = 300,
+            Record = new CnameRecord { Target = "target.example" },
+        });
+        builder.AddRecordSet(new MxRecordSet
+        {
+            Name = "@",
+            Ttl = 300,
+            Records = [new MxRecord { Preference = 10, Exchange = "mail.example.com" }],
+        });
+        builder.AddRecordSet(new TxtRecordSet
+        {
+            Name = "@",
+            Ttl = 300,
+            Records = [new TxtRecord { Text = "hello" }],
         });
         builder.AddRecordSet(new PtrRecordSet
         {
@@ -69,11 +118,19 @@ public sealed class DnsZoneBuilderTests
         var startOfAuthorityRecordSet = Assert.IsType<SoaRecordSet>(zone.RecordSets.ElementAt(0));
         var nameServerRecordSet = Assert.IsType<NsRecordSet>(zone.RecordSets.ElementAt(1));
         var addressRecordSet = Assert.IsType<ARecordSet>(zone.RecordSets.ElementAt(2));
-        var pointerRecordSet = Assert.IsType<PtrRecordSet>(zone.RecordSets.ElementAt(3));
+        var ipv6AddressRecordSet = Assert.IsType<AaaaRecordSet>(zone.RecordSets.ElementAt(3));
+        var canonicalNameRecordSet = Assert.IsType<CnameRecordSet>(zone.RecordSets.ElementAt(4));
+        var mailExchangeRecordSet = Assert.IsType<MxRecordSet>(zone.RecordSets.ElementAt(5));
+        var textRecordSet = Assert.IsType<TxtRecordSet>(zone.RecordSets.ElementAt(6));
+        var pointerRecordSet = Assert.IsType<PtrRecordSet>(zone.RecordSets.ElementAt(7));
         Assert.Equal("ns1.example.com", startOfAuthorityRecordSet.Record.PrimaryNameServer);
         Assert.Equal("hostmaster@example.com", startOfAuthorityRecordSet.Record.ResponsibleMailbox);
         Assert.Equal("ns1.example.com", nameServerRecordSet.Records.Single().NameServer);
         Assert.Equal("192.0.2.1", addressRecordSet.Records.Single().Address);
+        Assert.Equal("2001:0db8:0000:0000:0000:0000:0000:0001", ipv6AddressRecordSet.Records.Single().Address);
+        Assert.Equal("target.example", canonicalNameRecordSet.Record.Target);
+        Assert.Equal("mail.example.com", mailExchangeRecordSet.Records.Single().Exchange);
+        Assert.Equal("hello", textRecordSet.Records.Single().Text);
         Assert.Equal("target.example", pointerRecordSet.Records.Single().Target);
     }
 
@@ -239,6 +296,90 @@ public sealed class DnsZoneBuilderTests
                 new NsRecord { NameServer = "ns1.example." },
             ],
         }));
+    }
+
+    [Fact]
+    public void AddRecordSet_WhenNewRecordValuesAreInvalid_ThrowsArgumentException()
+    {
+        var builder = new DnsZoneBuilder("example.com");
+
+        Assert.Throws<ArgumentException>(() => builder.AddRecordSet(new AaaaRecordSet
+        {
+            Name = "ipv6",
+            Ttl = 300,
+            Records = [new AaaaRecord { Address = "192.0.2.1" }],
+        }));
+        Assert.Throws<ArgumentException>(() => builder.AddRecordSet(new CnameRecordSet
+        {
+            Name = "alias",
+            Ttl = 300,
+            Record = new CnameRecord { Target = "invalid..example" },
+        }));
+        Assert.Throws<ArgumentException>(() => builder.AddRecordSet(new MxRecordSet
+        {
+            Name = "@",
+            Ttl = 300,
+            Records = [new MxRecord { Preference = 10, Exchange = "invalid..example" }],
+        }));
+        Assert.Throws<ArgumentException>(() => builder.AddRecordSet(new TxtRecordSet
+        {
+            Name = "@",
+            Ttl = 300,
+            Records = [new TxtRecord { Text = "\uD800" }],
+        }));
+    }
+
+    [Fact]
+    public void AddRecordSet_WhenNewRecordValuesContainCanonicalDuplicates_ThrowsArgumentException()
+    {
+        var builder = new DnsZoneBuilder("example.com");
+
+        Assert.Throws<ArgumentException>(() => builder.AddRecordSet(new AaaaRecordSet
+        {
+            Name = "ipv6",
+            Ttl = 300,
+            Records =
+            [
+                new AaaaRecord { Address = "2001:db8::1" },
+                new AaaaRecord { Address = "2001:0db8:0000:0000:0000:0000:0000:0001" },
+            ],
+        }));
+        Assert.Throws<ArgumentException>(() => builder.AddRecordSet(new MxRecordSet
+        {
+            Name = "@",
+            Ttl = 300,
+            Records =
+            [
+                new MxRecord { Preference = 10, Exchange = "Mail.Example" },
+                new MxRecord { Preference = 10, Exchange = "mail.example." },
+            ],
+        }));
+        Assert.Throws<ArgumentException>(() => builder.AddRecordSet(new TxtRecordSet
+        {
+            Name = "@",
+            Ttl = 300,
+            Records =
+            [
+                new TxtRecord { Text = "duplicate" },
+                new TxtRecord { Text = "duplicate" },
+            ],
+        }));
+    }
+
+    [Fact]
+    public void AddRecordSet_WhenCnameWouldCoexistWithOtherData_ThrowsWithoutMutation()
+    {
+        var cnameFirstBuilder = CreateBuilder();
+        cnameFirstBuilder.AddCnameRecord(300, "alias", "target.example.com");
+
+        Assert.Throws<InvalidOperationException>(() => cnameFirstBuilder.AddARecord(300, "alias", "192.0.2.1"));
+
+        var addressFirstBuilder = CreateBuilder();
+        addressFirstBuilder.AddARecord(300, "alias", "192.0.2.1");
+
+        Assert.Throws<InvalidOperationException>(() => addressFirstBuilder.AddCnameRecord(300, "alias", "target.example.com"));
+        Assert.Equal(3, cnameFirstBuilder.Build().RecordSets.Count);
+        Assert.Equal(3, addressFirstBuilder.Build().RecordSets.Count);
     }
 
     [Fact]

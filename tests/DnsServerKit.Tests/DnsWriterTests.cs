@@ -138,6 +138,125 @@ public sealed class DnsWriterTests
     }
 
     [Fact]
+    public void Write_WhenAnswerIsAaaaRecord_WritesSixteenAddressOctets()
+    {
+        var queryBytes = DnsTestPacket.CreateQuery("ipv6.example.com", (ushort)RecordType.Aaaa);
+        var buffer = new byte[512];
+        queryBytes.AsSpan().CopyTo(buffer);
+        var query = new DnsQueryContext();
+        _ = DnsReader.Read(buffer.AsMemory(0, queryBytes.Length), query);
+        var zoneBuilder = CreateRootZoneBuilder();
+        zoneBuilder.AddAaaaRecord(120, "ipv6.example.com", "2001:db8::1");
+        var store = CreateStore(zoneBuilder);
+        _ = store.TryResolve(query.Question, out var answerSet);
+        var response = new DnsResponseContext();
+        response.Set(query, answerSet, ResponseCode.NoError, false, true);
+
+        var length = DnsWriter.Write(buffer, response);
+        var answerOffset = queryBytes.Length;
+
+        Assert.Equal(queryBytes.Length + 28, length);
+        Assert.Equal((ushort)RecordType.Aaaa, BinaryPrimitives.ReadUInt16BigEndian(buffer.AsSpan(answerOffset + 2)));
+        Assert.Equal((ushort)16, BinaryPrimitives.ReadUInt16BigEndian(buffer.AsSpan(answerOffset + 10)));
+        Assert.Equal(
+            new byte[] { 0x20, 0x01, 0x0D, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 },
+            buffer.AsSpan(answerOffset + 12, 16).ToArray());
+    }
+
+    [Fact]
+    public void Write_WhenRequestedTypeIsAtCnameOwner_WritesCanonicalNameAnswer()
+    {
+        var queryBytes = DnsTestPacket.CreateQuery("alias.example.com");
+        var buffer = new byte[512];
+        queryBytes.AsSpan().CopyTo(buffer);
+        var query = new DnsQueryContext();
+        _ = DnsReader.Read(buffer.AsMemory(0, queryBytes.Length), query);
+        var zoneBuilder = CreateRootZoneBuilder();
+        zoneBuilder.AddCnameRecord(180, "alias.example.com", "target.example.com");
+        var store = CreateStore(zoneBuilder);
+        Assert.True(store.TryResolve(query.Question, out var answerSet));
+        var response = new DnsResponseContext();
+        response.Set(query, answerSet, ResponseCode.NoError, false, true);
+
+        var length = DnsWriter.Write(buffer, response);
+        var answerOffset = queryBytes.Length;
+        var targetOffset = answerOffset + 12;
+        var target = DnsTestPacket.ReadName(buffer.AsSpan(0, length), ref targetOffset);
+
+        Assert.IsType<CnameRecordSet>(answerSet);
+        Assert.Equal((ushort)RecordType.CName, BinaryPrimitives.ReadUInt16BigEndian(buffer.AsSpan(answerOffset + 2)));
+        Assert.Equal("target.example.com", target);
+        Assert.Equal(length, targetOffset);
+    }
+
+    [Fact]
+    public void Write_WhenAnswerIsMxRecordSet_WritesPreferenceAndExchangeForEveryRecord()
+    {
+        var queryBytes = DnsTestPacket.CreateQuery("example.com", (ushort)RecordType.Mx);
+        var buffer = new byte[512];
+        queryBytes.AsSpan().CopyTo(buffer);
+        var query = new DnsQueryContext();
+        _ = DnsReader.Read(buffer.AsMemory(0, queryBytes.Length), query);
+        var zoneBuilder = CreateRootZoneBuilder();
+        zoneBuilder.AddMxRecord(
+            240,
+            "example.com",
+            new MxRecord { Preference = 10, Exchange = "mail1.example.com" },
+            new MxRecord { Preference = 20, Exchange = "mail2.example.com" });
+        var store = CreateStore(zoneBuilder);
+        _ = store.TryResolve(query.Question, out var answerSet);
+        var response = new DnsResponseContext();
+        response.Set(query, answerSet, ResponseCode.NoError, false, true);
+
+        var length = DnsWriter.Write(buffer, response);
+        var firstAnswerOffset = queryBytes.Length;
+        var firstExchangeOffset = firstAnswerOffset + 14;
+        var firstExchange = DnsTestPacket.ReadName(buffer.AsSpan(0, length), ref firstExchangeOffset);
+        var secondAnswerOffset = firstExchangeOffset;
+        var secondExchangeOffset = secondAnswerOffset + 14;
+        var secondExchange = DnsTestPacket.ReadName(buffer.AsSpan(0, length), ref secondExchangeOffset);
+
+        Assert.Equal((ushort)2, BinaryPrimitives.ReadUInt16BigEndian(buffer.AsSpan(6)));
+        Assert.Equal((ushort)10, BinaryPrimitives.ReadUInt16BigEndian(buffer.AsSpan(firstAnswerOffset + 12)));
+        Assert.Equal((ushort)20, BinaryPrimitives.ReadUInt16BigEndian(buffer.AsSpan(secondAnswerOffset + 12)));
+        Assert.Equal("mail1.example.com", firstExchange);
+        Assert.Equal("mail2.example.com", secondExchange);
+        Assert.Equal(length, secondExchangeOffset);
+    }
+
+    [Fact]
+    public void Write_WhenTxtTextExceedsCharacterStringLimit_SplitsUtf8TextWithinOneRecord()
+    {
+        var queryBytes = DnsTestPacket.CreateQuery("txt.example.com", (ushort)RecordType.Txt);
+        var buffer = new byte[512];
+        queryBytes.AsSpan().CopyTo(buffer);
+        var query = new DnsQueryContext();
+        _ = DnsReader.Read(buffer.AsMemory(0, queryBytes.Length), query);
+        var zoneBuilder = CreateRootZoneBuilder();
+        zoneBuilder.AddTxtRecord(300, "txt.example.com", new string('a', 256), "é");
+        var store = CreateStore(zoneBuilder);
+        _ = store.TryResolve(query.Question, out var answerSet);
+        var response = new DnsResponseContext();
+        response.Set(query, answerSet, ResponseCode.NoError, false, true);
+
+        var length = DnsWriter.Write(buffer, response);
+        var firstAnswerOffset = queryBytes.Length;
+        var firstResourceDataOffset = firstAnswerOffset + 12;
+        var secondAnswerOffset = firstResourceDataOffset + 258;
+        var secondResourceDataOffset = secondAnswerOffset + 12;
+
+        Assert.Equal((ushort)2, BinaryPrimitives.ReadUInt16BigEndian(buffer.AsSpan(6)));
+        Assert.Equal((ushort)258, BinaryPrimitives.ReadUInt16BigEndian(buffer.AsSpan(firstAnswerOffset + 10)));
+        Assert.Equal((byte)255, buffer[firstResourceDataOffset]);
+        Assert.All(buffer.AsSpan(firstResourceDataOffset + 1, 255).ToArray(), value => Assert.Equal((byte)'a', value));
+        Assert.Equal((byte)1, buffer[firstResourceDataOffset + 256]);
+        Assert.Equal((byte)'a', buffer[firstResourceDataOffset + 257]);
+        Assert.Equal((ushort)3, BinaryPrimitives.ReadUInt16BigEndian(buffer.AsSpan(secondAnswerOffset + 10)));
+        Assert.Equal(new byte[] { 2, 0xC3, 0xA9 }, buffer.AsSpan(secondResourceDataOffset, 3).ToArray());
+        Assert.Equal(secondResourceDataOffset + 3, length);
+    }
+
+    [Fact]
     public void Write_WhenResponseHasNoAnswer_WritesQuestionAndResponseCode()
     {
         var queryBytes = DnsTestPacket.CreateQuery();
@@ -185,10 +304,10 @@ public sealed class DnsWriterTests
     }
 
     [Theory]
-    [InlineData((byte)ResponseCode.FormatError)]
-    [InlineData((byte)ResponseCode.NotImplemented)]
-    [InlineData((byte)ResponseCode.ServerFailure)]
-    public void WriteErrorResponse_WhenResponseCodeIsSupported_WritesExactHeader(byte responseCodeValue)
+    [InlineData((ushort)ResponseCode.FormatError)]
+    [InlineData((ushort)ResponseCode.NotImplemented)]
+    [InlineData((ushort)ResponseCode.ServerFailure)]
+    public void WriteErrorResponse_WhenResponseCodeIsSupported_WritesExactHeader(ushort responseCodeValue)
     {
         var responseCode = (ResponseCode)responseCodeValue;
         var destination = new byte[12];
@@ -197,7 +316,7 @@ public sealed class DnsWriterTests
         var writtenBytes = DnsWriter.WriteErrorResponse(destination, errorResponse, true);
 
         var flags = BinaryPrimitives.ReadUInt16BigEndian(destination.AsSpan(2));
-        var expectedFlags = (ushort)(0x8000 | 0x7800 | 0x0100 | 0x0080 | (byte)responseCode);
+        var expectedFlags = (ushort)(0x8000 | 0x7800 | 0x0100 | 0x0080 | (ushort)responseCode);
         Assert.Equal(12, writtenBytes);
         Assert.Equal((ushort)0x1234, BinaryPrimitives.ReadUInt16BigEndian(destination));
         Assert.Equal(expectedFlags, flags);
@@ -375,6 +494,56 @@ public sealed class DnsWriterTests
         Assert.True(found);
         Assert.True(responseLength > queryBytes.Length);
         Assert.Equal(0, allocatedBytes);
+    }
+
+    [Fact]
+    public void ParseLookupAndWrite_WhenNewRecordTypesAreWarmed_DoesNotAllocate()
+    {
+        var zoneBuilder = CreateRootZoneBuilder();
+        zoneBuilder.AddAaaaRecord(300, "ipv6.example", "2001:db8::1");
+        zoneBuilder.AddCnameRecord(300, "alias.example", "target.example");
+        zoneBuilder.AddMxRecord(300, "mail.example", new MxRecord { Preference = 10, Exchange = "mx.example" });
+        zoneBuilder.AddTxtRecord(300, "txt.example", "v=spf1 -all");
+        var store = CreateStore(zoneBuilder);
+        var queryBytes = new[]
+        {
+            DnsTestPacket.CreateQuery("ipv6.example", (ushort)RecordType.Aaaa),
+            DnsTestPacket.CreateQuery("alias.example"),
+            DnsTestPacket.CreateQuery("mail.example", (ushort)RecordType.Mx),
+            DnsTestPacket.CreateQuery("txt.example", (ushort)RecordType.Txt),
+        };
+        var buffers = new[] { new byte[512], new byte[512], new byte[512], new byte[512] };
+        var queries = new[] { new DnsQueryContext(), new DnsQueryContext(), new DnsQueryContext(), new DnsQueryContext() };
+        var responses = new[] { new DnsResponseContext(), new DnsResponseContext(), new DnsResponseContext(), new DnsResponseContext() };
+
+        for (var recordTypeIndex = 0; recordTypeIndex < queryBytes.Length; recordTypeIndex++)
+        {
+            queryBytes[recordTypeIndex].AsSpan().CopyTo(buffers[recordTypeIndex]);
+            _ = DnsReader.Read(buffers[recordTypeIndex].AsMemory(0, queryBytes[recordTypeIndex].Length), queries[recordTypeIndex]);
+            _ = store.TryResolve(queries[recordTypeIndex].Question, out var answerSet);
+            responses[recordTypeIndex].Set(queries[recordTypeIndex], answerSet, ResponseCode.NoError, false, true);
+            _ = DnsWriter.Write(buffers[recordTypeIndex], responses[recordTypeIndex]);
+        }
+
+        var allocations = new long[queryBytes.Length];
+        for (var recordTypeIndex = 0; recordTypeIndex < queryBytes.Length; recordTypeIndex++)
+        {
+            queryBytes[recordTypeIndex].AsSpan().CopyTo(buffers[recordTypeIndex]);
+            var allocatedBytesBefore = GC.GetAllocatedBytesForCurrentThread();
+            var readResult = DnsReader.Read(
+                buffers[recordTypeIndex].AsMemory(0, queryBytes[recordTypeIndex].Length),
+                queries[recordTypeIndex]);
+            var found = store.TryResolve(queries[recordTypeIndex].Question, out var answerSet);
+            responses[recordTypeIndex].Set(queries[recordTypeIndex], answerSet, ResponseCode.NoError, false, true);
+            var responseLength = DnsWriter.Write(buffers[recordTypeIndex], responses[recordTypeIndex]);
+            allocations[recordTypeIndex] = GC.GetAllocatedBytesForCurrentThread() - allocatedBytesBefore;
+
+            Assert.Equal(DnsReadOutcome.Query, readResult.Outcome);
+            Assert.True(found);
+            Assert.True(responseLength > queryBytes[recordTypeIndex].Length);
+        }
+
+        Assert.All(allocations, allocation => Assert.Equal(0, allocation));
     }
 
     [Fact]

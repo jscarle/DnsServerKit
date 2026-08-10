@@ -37,7 +37,10 @@ public sealed class DnsZoneStore
             return false;
         }
 
-        return recordSets.TryGetValue(type, out recordSet);
+        if (recordSets.TryGetValue(type, out recordSet))
+            return true;
+
+        return recordSets.TryGetValue((ushort)RecordType.CName, out recordSet);
     }
 
     internal bool TryResolve(DnsQuestionContext question, out RecordSet? recordSet)
@@ -59,7 +62,10 @@ public sealed class DnsZoneStore
             return false;
         }
 
-        return recordSets.TryGetValue(question.Type, out recordSet);
+        if (recordSets.TryGetValue(question.Type, out recordSet))
+            return true;
+
+        return recordSets.TryGetValue((ushort)RecordType.CName, out recordSet);
     }
 
     private static StoreState CreateState(DnsZoneSet zoneSet)
@@ -76,9 +82,13 @@ public sealed class DnsZoneStore
                 var type = recordSet switch
                 {
                     ARecordSet => (ushort)RecordType.A,
+                    AaaaRecordSet => (ushort)RecordType.Aaaa,
+                    CnameRecordSet => (ushort)RecordType.CName,
+                    MxRecordSet => (ushort)RecordType.Mx,
                     PtrRecordSet => (ushort)RecordType.Ptr,
                     NsRecordSet => (ushort)RecordType.Ns,
                     SoaRecordSet => (ushort)RecordType.Soa,
+                    TxtRecordSet => (ushort)RecordType.Txt,
                     _ => throw new NotSupportedException($"The '{recordSet.GetType().Name}' DNS record set type is not supported."),
                 };
 
