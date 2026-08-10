@@ -21,6 +21,23 @@ public sealed class DnsReaderTests
     }
 
     [Fact]
+    public void DecodeDnsName_WhenLabelsEndWithPointer_DecodesCompleteNameAndAdvancesPastPointer()
+    {
+        byte[] packet =
+        [
+            0x07, (byte)'e', (byte)'x', (byte)'a', (byte)'m', (byte)'p', (byte)'l', (byte)'e',
+            0x03, (byte)'c', (byte)'o', (byte)'m', 0x00,
+            0x03, (byte)'w', (byte)'w', (byte)'w', 0xC0, 0x00,
+        ];
+        var offset = 13;
+
+        var name = NameHelper.DecodeDnsName(packet, ref offset);
+
+        Assert.Equal("www.example.com", name);
+        Assert.Equal(19, offset);
+    }
+
+    [Fact]
     public void TryReadBytes_WhenNamePointerReferencesItself_ReturnsFailure()
     {
         byte[] dnsQuery =
