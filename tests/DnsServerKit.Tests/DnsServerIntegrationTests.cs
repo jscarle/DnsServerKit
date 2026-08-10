@@ -1,8 +1,8 @@
 using System.Buffers.Binary;
 using System.Net;
 using System.Net.Sockets;
-using DnsServerKit.Data;
-using DnsServerKit.ResourceRecords;
+using DnsServerKit.Records;
+using DnsServerKit.Zones;
 using Microsoft.Extensions.Logging.Abstractions;
 using Xunit;
 
@@ -13,9 +13,38 @@ public sealed class DnsServerIntegrationTests
     [Fact]
     public async Task ConcurrentWorkers_WhenQueriesArriveFromMultipleClients_PreserveTransactionAndEndpointPairing()
     {
-        var dataSetBuilder = new DnsDataSetBuilder();
-        dataSetBuilder.Add(new ARecord(new DnsName("example.com"), IPAddress.Parse("192.0.2.1")));
-        var store = new DnsDataSetStore(dataSetBuilder.Build());
+        var zoneBuilder = new DnsZoneBuilder("example.com");
+        zoneBuilder.AddRecordSet(new SoaRecordSet
+        {
+            Name = "@",
+            Ttl = 300,
+            Record = new SoaRecord
+            {
+                PrimaryNameServer = "ns1.example.com",
+                ResponsibleMailbox = "hostmaster@example.com",
+                Serial = 1,
+                Refresh = 3600,
+                Retry = 600,
+                Expire = 1_209_600,
+                Minimum = 300,
+            },
+        });
+        zoneBuilder.AddRecordSet(new NsRecordSet
+        {
+            Name = "@",
+            Ttl = 300,
+            Records = [new NsRecord { NameServer = "ns1.example.com" }],
+        });
+        zoneBuilder.AddRecordSet(new ARecordSet
+        {
+            Name = "@",
+            Ttl = 300,
+            Records = [new ARecord { Address = "192.0.2.1" }],
+        });
+        var zoneSetBuilder = new DnsZoneSetBuilder();
+        zoneSetBuilder.Load(zoneBuilder);
+        var store = new DnsZoneStore();
+        store.Load(zoneSetBuilder.Build());
         var options = new DnsServerOptions
         {
             ListenAddress = IPAddress.Loopback,

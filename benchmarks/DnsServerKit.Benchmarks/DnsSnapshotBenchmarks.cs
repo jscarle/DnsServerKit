@@ -1,7 +1,6 @@
-using System.Net;
 using BenchmarkDotNet.Attributes;
-using DnsServerKit.Data;
-using DnsServerKit.ResourceRecords;
+using DnsServerKit.Records;
+using DnsServerKit.Zones;
 
 namespace DnsServerKit.Benchmarks;
 
@@ -9,30 +8,60 @@ namespace DnsServerKit.Benchmarks;
 [MemoryDiagnoser]
 public class DnsSnapshotBenchmarks
 {
-    private DnsResourceRecord[] _records = null!;
+    private string[] _names = null!;
 
     [Params(1_000, 100_000, 1_000_000)]
-    public int DataSetSize { get; set; }
+    public int RecordSetCount { get; set; }
 
     [GlobalSetup]
     public void Setup()
     {
-        _records = new DnsResourceRecord[DataSetSize];
-        var ipAddress = IPAddress.Parse("192.0.2.1");
-        for (var recordIndex = 0; recordIndex < _records.Length; recordIndex++)
-        {
-            var name = new DnsName($"host{recordIndex}.example.com");
-            _records[recordIndex] = new ARecord(name, ipAddress, 300);
-        }
+        _names = new string[RecordSetCount];
+        for (var recordIndex = 0; recordIndex < _names.Length; recordIndex++)
+            _names[recordIndex] = $"host{recordIndex}";
     }
 
     [Benchmark]
-    public DnsDataSet RebuildSnapshot()
+    public DnsZoneSet BuildAndLoadSnapshot()
     {
-        var builder = new DnsDataSetBuilder();
-        foreach (var record in _records)
-            builder.Add(record);
+        var zoneBuilder = new DnsZoneBuilder("example.com");
+        zoneBuilder.AddRecordSet(new SoaRecordSet
+        {
+            Name = "@",
+            Ttl = 300,
+            Record = new SoaRecord
+            {
+                PrimaryNameServer = "ns1.example.com",
+                ResponsibleMailbox = "hostmaster@example.com",
+                Serial = 1,
+                Refresh = 3600,
+                Retry = 600,
+                Expire = 1_209_600,
+                Minimum = 300,
+            },
+        });
+        zoneBuilder.AddRecordSet(new NsRecordSet
+        {
+            Name = "@",
+            Ttl = 300,
+            Records = [new NsRecord { NameServer = "ns1.example.com" }],
+        });
+        foreach (var name in _names)
+        {
+            zoneBuilder.AddRecordSet(new ARecordSet
+            {
+                Name = name,
+                Ttl = 300,
+                Records = [new ARecord { Address = "192.0.2.1" }],
+            });
+        }
 
-        return builder.Build();
+        var zoneSetBuilder = new DnsZoneSetBuilder();
+        zoneSetBuilder.Load(zoneBuilder);
+        var zoneSet = zoneSetBuilder.Build();
+        var store = new DnsZoneStore();
+        store.Load(zoneSet);
+
+        return store.Current;
     }
 }

@@ -1,5 +1,4 @@
-using System.Net;
-using DnsServerKit.ResourceRecords;
+using DnsServerKit.Internal.Protocol;
 using Xunit;
 
 namespace DnsServerKit.Tests;
@@ -56,21 +55,4 @@ public sealed class DnsNameTests
             Assert.Throws<FormatException>(() => new DnsName(invalidName));
     }
 
-    [Fact]
-    public void ARecord_WhenAddressIsIpv6_ThrowsArgumentException()
-    {
-        var name = new DnsName("example.com");
-
-        Assert.Throws<ArgumentException>(() => new ARecord(name, IPAddress.IPv6Loopback));
-    }
-
-    [Fact]
-    public void ARecord_WhenAddressIsIpv4_PreservesManagedAddress()
-    {
-        var address = IPAddress.Parse("192.0.2.1");
-
-        var record = new ARecord(new DnsName("example.com"), address);
-
-        Assert.Same(address, record.IpAddress);
-    }
 }

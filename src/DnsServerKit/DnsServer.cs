@@ -1,9 +1,9 @@
 using System.Net;
 using System.Net.Sockets;
-using DnsServerKit.Data;
-using DnsServerKit.Parameters;
-using DnsServerKit.Queries;
-using DnsServerKit.Responses;
+using DnsServerKit.Internal.Protocol;
+using DnsServerKit.Internal.Queries;
+using DnsServerKit.Internal.Responses;
+using DnsServerKit.Zones;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 
@@ -11,8 +11,9 @@ namespace DnsServerKit;
 
 public sealed partial class DnsServer : IHostedService, IAsyncDisposable
 {
+    public IPEndPoint? BoundEndPoint => _udpSocket?.LocalEndPoint as IPEndPoint;
     private const int MaximumUdpMessageLength = 512;
-    private readonly DnsDataSetStore _dataSetStore;
+    private readonly DnsZoneStore _zoneStore;
     private readonly DnsServerOptions _options;
     private readonly ILogger<DnsServer> _logger;
     private CancellationTokenSource? _stopSource;
@@ -21,14 +22,12 @@ public sealed partial class DnsServer : IHostedService, IAsyncDisposable
     private Task[]? _workerTasks;
     private Task? _statisticsTask;
 
-    public IPEndPoint? BoundEndPoint => _udpSocket?.LocalEndPoint as IPEndPoint;
-
-    public DnsServer(DnsDataSetStore dataSetStore, DnsServerOptions options, ILogger<DnsServer> logger)
+    public DnsServer(DnsZoneStore zoneStore, DnsServerOptions options, ILogger<DnsServer> logger)
     {
-        ArgumentNullException.ThrowIfNull(dataSetStore);
+        ArgumentNullException.ThrowIfNull(zoneStore);
         ArgumentNullException.ThrowIfNull(options);
         ArgumentNullException.ThrowIfNull(logger);
-        _dataSetStore = dataSetStore;
+        _zoneStore = zoneStore;
         _options = options;
         _logger = logger;
     }
@@ -51,10 +50,7 @@ public sealed partial class DnsServer : IHostedService, IAsyncDisposable
         if (_options.StatisticsInterval <= TimeSpan.Zero)
             throw new InvalidOperationException("The statistics interval must be greater than zero.");
 
-        var socket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp)
-        {
-            ReceiveBufferSize = _options.ReceiveBufferSize,
-        };
+        var socket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp) { ReceiveBufferSize = _options.ReceiveBufferSize };
 
         try
         {
@@ -94,17 +90,21 @@ public sealed partial class DnsServer : IHostedService, IAsyncDisposable
         socket.Dispose();
 
         if (_workerTasks is not null)
-            await Task.WhenAll(_workerTasks).WaitAsync(cancellationToken).ConfigureAwait(false);
+            await Task.WhenAll(_workerTasks)
+                .WaitAsync(cancellationToken)
+                .ConfigureAwait(false);
 
         if (_statisticsTask is not null)
-            await _statisticsTask.WaitAsync(cancellationToken).ConfigureAwait(false);
+            await _statisticsTask.WaitAsync(cancellationToken)
+                .ConfigureAwait(false);
 
         LogServerStopped(_logger);
     }
 
     public async ValueTask DisposeAsync()
     {
-        await StopAsync(CancellationToken.None).ConfigureAwait(false);
+        await StopAsync(CancellationToken.None)
+            .ConfigureAwait(false);
         _stopSource?.Dispose();
     }
 
@@ -115,11 +115,8 @@ public sealed partial class DnsServer : IHostedService, IAsyncDisposable
             var hasTrustedQuery = false;
             try
             {
-                var receivedBytes = await socket.ReceiveFromAsync(
-                    worker.Buffer.AsMemory(),
-                    SocketFlags.None,
-                    worker.RemoteAddress,
-                    CancellationToken.None).ConfigureAwait(false);
+                var receivedBytes = await socket.ReceiveFromAsync(worker.Buffer.AsMemory(), SocketFlags.None, worker.RemoteAddress, CancellationToken.None)
+                    .ConfigureAwait(false);
                 worker.Received++;
 
                 var datagram = worker.Buffer.AsMemory(0, receivedBytes);
@@ -146,49 +143,25 @@ public sealed partial class DnsServer : IHostedService, IAsyncDisposable
                         worker.Malformed++;
                     }
 
-                    var errorLength = DnsWriter.WriteErrorResponse(
-                        worker.Buffer,
-                        readResult.ErrorResponse,
-                        _options.RecursionAvailable);
-                    await socket.SendToAsync(
-                        worker.Buffer.AsMemory(0, errorLength),
-                        SocketFlags.None,
-                        worker.RemoteAddress,
-                        CancellationToken.None).ConfigureAwait(false);
+                    var errorLength = DnsWriter.WriteErrorResponse(worker.Buffer, readResult.ErrorResponse, _options.RecursionAvailable);
+                    await socket.SendToAsync(worker.Buffer.AsMemory(0, errorLength), SocketFlags.None, worker.RemoteAddress, CancellationToken.None)
+                        .ConfigureAwait(false);
                     worker.ResponsesSent++;
                     continue;
                 }
 
                 hasTrustedQuery = true;
-                var dataSet = _dataSetStore.Current;
-                if (dataSet.TryResolve(worker.Query.Question, out var answerSet))
-                {
-                    worker.Response.Set(
-                        worker.Query,
-                        answerSet,
-                        ResponseCode.NoError,
-                        false,
-                        _options.RecursionAvailable);
-                }
+                if (_zoneStore.TryResolve(worker.Query.Question, out var answerSet))
+                    worker.Response.Set(worker.Query, answerSet, ResponseCode.NoError, false, _options.RecursionAvailable);
                 else
-                {
-                    worker.Response.Set(
-                        worker.Query,
-                        null,
-                        ResponseCode.NotZone,
-                        false,
-                        _options.RecursionAvailable);
-                }
+                    worker.Response.Set(worker.Query, null, ResponseCode.NotZone, false, _options.RecursionAvailable);
 
                 var responseLength = DnsWriter.Write(worker.Buffer, worker.Response);
                 if ((worker.Buffer[2] & 0x02) != 0)
                     worker.Truncated++;
 
-                await socket.SendToAsync(
-                    worker.Buffer.AsMemory(0, responseLength),
-                    SocketFlags.None,
-                    worker.RemoteAddress,
-                    CancellationToken.None).ConfigureAwait(false);
+                await socket.SendToAsync(worker.Buffer.AsMemory(0, responseLength), SocketFlags.None, worker.RemoteAddress, CancellationToken.None)
+                    .ConfigureAwait(false);
                 worker.Answered++;
                 worker.ResponsesSent++;
             }
@@ -214,20 +187,12 @@ public sealed partial class DnsServer : IHostedService, IAsyncDisposable
 
                 try
                 {
-                    var serverFailureResponse = new DnsErrorResponse(
-                        worker.Query.TransactionId,
-                        worker.Query.Operation,
-                        worker.Query.RecursionDesired,
-                        ResponseCode.ServerFailure);
-                    var errorLength = DnsWriter.WriteErrorResponse(
-                        worker.Buffer,
-                        serverFailureResponse,
-                        _options.RecursionAvailable);
-                    await socket.SendToAsync(
-                        worker.Buffer.AsMemory(0, errorLength),
-                        SocketFlags.None,
-                        worker.RemoteAddress,
-                        CancellationToken.None).ConfigureAwait(false);
+                    var serverFailureResponse = new DnsErrorResponse(worker.Query.TransactionId, worker.Query.Operation, worker.Query.RecursionDesired,
+                        ResponseCode.ServerFailure
+                    );
+                    var errorLength = DnsWriter.WriteErrorResponse(worker.Buffer, serverFailureResponse, _options.RecursionAvailable);
+                    await socket.SendToAsync(worker.Buffer.AsMemory(0, errorLength), SocketFlags.None, worker.RemoteAddress, CancellationToken.None)
+                        .ConfigureAwait(false);
                     worker.ResponsesSent++;
                 }
                 catch (SocketException)
@@ -243,7 +208,8 @@ public sealed partial class DnsServer : IHostedService, IAsyncDisposable
         using var timer = new PeriodicTimer(_options.StatisticsInterval);
         try
         {
-            while (await timer.WaitForNextTickAsync(stoppingToken).ConfigureAwait(false))
+            while (await timer.WaitForNextTickAsync(stoppingToken)
+                       .ConfigureAwait(false))
             {
                 long received = 0;
                 long answered = 0;
@@ -268,17 +234,7 @@ public sealed partial class DnsServer : IHostedService, IAsyncDisposable
                     unexpectedFailures += Volatile.Read(ref worker.UnexpectedFailures);
                 }
 
-                LogStatistics(
-                    _logger,
-                    received,
-                    answered,
-                    responsesSent,
-                    dropped,
-                    malformed,
-                    unsupported,
-                    truncated,
-                    socketFailures,
-                    unexpectedFailures);
+                LogStatistics(_logger, received, answered, responsesSent, dropped, malformed, unsupported, truncated, socketFailures, unexpectedFailures);
             }
         }
         catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
@@ -286,13 +242,18 @@ public sealed partial class DnsServer : IHostedService, IAsyncDisposable
         }
     }
 
-    [LoggerMessage(EventId = 1, Level = LogLevel.Information, Message = "DNS server listening on {EndPoint} with {WorkerCount} workers and a {ReceiveBufferSize}-byte socket receive buffer.")]
+    [LoggerMessage(EventId = 1, Level = LogLevel.Information,
+        Message = "DNS server listening on {EndPoint} with {WorkerCount} workers and a {ReceiveBufferSize}-byte socket receive buffer."
+    )]
     private static partial void LogServerStarted(ILogger logger, IPEndPoint? endPoint, int workerCount, int receiveBufferSize);
 
     [LoggerMessage(EventId = 2, Level = LogLevel.Information, Message = "DNS server stopped.")]
     private static partial void LogServerStopped(ILogger logger);
 
-    [LoggerMessage(EventId = 3, Level = LogLevel.Information, Message = "DNS totals: received={Received}, answered={Answered}, responses={ResponsesSent}, dropped={Dropped}, malformed={Malformed}, unsupported={Unsupported}, truncated={Truncated}, socketFailures={SocketFailures}, unexpectedFailures={UnexpectedFailures}.")]
+    [LoggerMessage(EventId = 3, Level = LogLevel.Information,
+        Message =
+            "DNS totals: received={Received}, answered={Answered}, responses={ResponsesSent}, dropped={Dropped}, malformed={Malformed}, unsupported={Unsupported}, truncated={Truncated}, socketFailures={SocketFailures}, unexpectedFailures={UnexpectedFailures}."
+    )]
     private static partial void LogStatistics(
         ILogger logger,
         long received,
@@ -303,16 +264,17 @@ public sealed partial class DnsServer : IHostedService, IAsyncDisposable
         long unsupported,
         long truncated,
         long socketFailures,
-        long unexpectedFailures);
+        long unexpectedFailures
+    );
 
     [LoggerMessage(EventId = 4, Level = LogLevel.Error, Message = "Unexpected DNS worker failure on worker {WorkerId}.")]
     private static partial void LogUnexpectedFailure(ILogger logger, Exception? exception, int workerId);
 
-    private sealed class DnsWorker
+    private sealed class DnsWorker(int id)
     {
-        public int Id { get; }
+        public int Id { get; } = id;
 
-        public byte[] Buffer { get; } = GC.AllocateUninitializedArray<byte>(MaximumUdpMessageLength, pinned: true);
+        public byte[] Buffer { get; } = GC.AllocateUninitializedArray<byte>(MaximumUdpMessageLength, true);
 
         public SocketAddress RemoteAddress { get; } = new(AddressFamily.InterNetwork, 16);
 
@@ -329,10 +291,5 @@ public sealed partial class DnsServer : IHostedService, IAsyncDisposable
         public long Truncated;
         public long SocketFailures;
         public long UnexpectedFailures;
-
-        public DnsWorker(int id)
-        {
-            Id = id;
-        }
     }
 }

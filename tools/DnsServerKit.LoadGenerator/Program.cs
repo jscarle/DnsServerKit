@@ -2,9 +2,10 @@ using System.Buffers.Binary;
 using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
-using DnsServerKit.Data;
+using DnsServerKit.Internal.Protocol;
 using DnsServerKit.Parameters;
-using DnsServerKit.ResourceRecords;
+using DnsServerKit.Records;
+using DnsServerKit.Zones;
 using Microsoft.Extensions.Logging.Abstractions;
 
 namespace DnsServerKit.LoadGenerator;
@@ -18,9 +19,44 @@ public static class Program
         if (queriesPerClient <= 0 || clientCount <= 0)
             throw new ArgumentOutOfRangeException(nameof(args), "Query and client counts must be greater than zero.");
 
-        var dataSetBuilder = new DnsDataSetBuilder();
-        dataSetBuilder.Add(new ARecord(new DnsName("load.example"), IPAddress.Parse("192.0.2.1"), 300));
-        var store = new DnsDataSetStore(dataSetBuilder.Build());
+        var zoneBuilder = new DnsZoneBuilder("load.example");
+        zoneBuilder.AddRecordSet(new SoaRecordSet
+        {
+            Name = "@",
+            Ttl = 300,
+            Record = new SoaRecord
+            {
+                PrimaryNameServer = "ns1.load.example",
+                ResponsibleMailbox = "hostmaster@load.example",
+                Serial = 1,
+                Refresh = 3600,
+                Retry = 600,
+                Expire = 1_209_600,
+                Minimum = 300,
+            },
+        });
+        zoneBuilder.AddRecordSet(new NsRecordSet
+        {
+            Name = "@",
+            Ttl = 300,
+            Records = [new NsRecord { NameServer = "ns1.load.example" }],
+        });
+        zoneBuilder.AddRecordSet(new ARecordSet
+        {
+            Name = "@",
+            Ttl = 300,
+            Records = [new ARecord { Address = "192.0.2.1" }],
+        });
+        zoneBuilder.AddRecordSet(new ARecordSet
+        {
+            Name = "ns1",
+            Ttl = 300,
+            Records = [new ARecord { Address = "192.0.2.53" }],
+        });
+        var zoneSetBuilder = new DnsZoneSetBuilder();
+        zoneSetBuilder.Load(zoneBuilder);
+        var store = new DnsZoneStore();
+        store.Load(zoneSetBuilder.Build());
         int[] requestedWorkerCounts =
         [
             1,
@@ -37,7 +73,7 @@ public static class Program
     }
 
     private static async Task RunScenarioAsync(
-        DnsDataSetStore store,
+        DnsZoneStore store,
         int workerCount,
         int clientCount,
         int queriesPerClient)

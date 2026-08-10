@@ -1,6 +1,7 @@
 using System.Buffers.Binary;
+using DnsServerKit.Internal.Protocol;
+using DnsServerKit.Internal.Queries;
 using DnsServerKit.Parameters;
-using DnsServerKit.Queries;
 using Xunit;
 
 namespace DnsServerKit.Tests;
