@@ -80,8 +80,6 @@ public sealed class DnsReader
                 var type = (ushort)((span[offset] << 8) | span[offset + 1]);
                 var @class = (ushort)((span[offset + 2] << 8) | span[offset + 3]);
 
-                if (!Enum.IsDefined(typeof(RecordType), type))
-                    Result.Failure<DnsQuery>("Could not process the DNS query. Invalid RRType.");
                 if (!Enum.IsDefined(typeof(DnsClass), @class))
                     Result.Failure<DnsQuery>("Could not process the DNS query. Invalid Class.");
 

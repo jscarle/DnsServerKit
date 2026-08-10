@@ -83,4 +83,27 @@ public sealed class DnsReaderTests
         Assert.False(fullBufferResult.IsFailure(out _, out _));
         Assert.True(receivedDatagramResult.IsFailure(out _, out _));
     }
+
+    [Fact]
+    public void TryReadBytes_WhenQuestionTypeIsUnregistered_PreservesWireValue()
+    {
+        const ushort unregisteredRecordType = 65400;
+        byte[] dnsQuery =
+        [
+            0x12, 0x34,
+            0x00, 0x00,
+            0x00, 0x01,
+            0x00, 0x00,
+            0x00, 0x00,
+            0x00, 0x00,
+            0x00,
+            unregisteredRecordType >> 8, unregisteredRecordType & 0xFF,
+            0x00, 0x01,
+        ];
+
+        var result = DnsReader.TryReadBytes(dnsQuery);
+
+        Assert.False(result.IsFailure(out _, out var parsedQuery));
+        Assert.Equal(unregisteredRecordType, (ushort)parsedQuery.Questions[0].Type);
+    }
 }
