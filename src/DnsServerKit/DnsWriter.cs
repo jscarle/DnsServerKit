@@ -11,33 +11,77 @@ namespace DnsServerKit;
 [MustDisposeResource]
 public sealed class DnsWriter(DnsResponse dnsResponse) : IDisposable
 {
+    private const int MaximumUdpMessageLength = 512;
     private readonly Dictionary<string, int> _namePositions = new(StringComparer.Ordinal);
     private byte[]? _bytes;
 
     public ReadOnlyMemory<byte> GetBytes()
     {
-        using var memoryStream = new MemoryStream(512);
+        using var memoryStream = new MemoryStream(MaximumUdpMessageLength);
 
-        WriteHeader(memoryStream, dnsResponse);
+        WriteHeader(memoryStream, dnsResponse, dnsResponse.TC, dnsResponse.QDCount, dnsResponse.ANCount);
 
+        ushort writtenQuestionCount = 0;
+        var isTruncated = false;
         foreach (var question in dnsResponse.Questions)
         {
+            var questionStartPosition = memoryStream.Position;
             WriteName(memoryStream, question.Name);
             WriteQuestion(memoryStream, question);
+
+            if (memoryStream.Position > MaximumUdpMessageLength)
+            {
+                memoryStream.SetLength(questionStartPosition);
+                memoryStream.Position = questionStartPosition;
+                isTruncated = true;
+                break;
+            }
+
+            writtenQuestionCount++;
         }
 
-        foreach (var answer in dnsResponse.Answers)
+        ushort writtenAnswerCount = 0;
+        if (!isTruncated)
         {
-            WriteName(memoryStream, answer.Name);
-            WriteAnswer(memoryStream, answer);
-            WriteAnswerData(memoryStream, answer);
+            foreach (var answer in dnsResponse.Answers)
+            {
+                var answerStartPosition = memoryStream.Position;
+                WriteName(memoryStream, answer.Name);
+                WriteAnswer(memoryStream, answer);
+                WriteAnswerData(memoryStream, answer);
+
+                if (memoryStream.Position > MaximumUdpMessageLength)
+                {
+                    memoryStream.SetLength(answerStartPosition);
+                    memoryStream.Position = answerStartPosition;
+                    isTruncated = true;
+                    break;
+                }
+
+                writtenAnswerCount++;
+            }
         }
+
+        var messageEndPosition = memoryStream.Position;
+        memoryStream.Position = 0;
+        WriteHeader(
+            memoryStream,
+            dnsResponse,
+            dnsResponse.TC || isTruncated,
+            writtenQuestionCount,
+            writtenAnswerCount);
+        memoryStream.Position = messageEndPosition;
 
         var memory = ToReadOnlyMemory(memoryStream);
         return memory;
     }
 
-    private static void WriteHeader(MemoryStream memoryStream, DnsResponse dnsResponse)
+    private static void WriteHeader(
+        MemoryStream memoryStream,
+        DnsResponse dnsResponse,
+        bool isTruncated,
+        ushort questionCount,
+        ushort answerCount)
     {
         var bytes = ArrayPool<byte>.Shared.Rent(12);
 
@@ -48,7 +92,7 @@ public sealed class DnsWriter(DnsResponse dnsResponse) : IDisposable
         var flags = (ushort)((dnsResponse.QR ? 0x8000 : 0)
                              | ((ushort)dnsResponse.OpCode << 11)
                              | (dnsResponse.AA ? 0x0400 : 0)
-                             | (dnsResponse.TC ? 0x0200 : 0)
+                             | (isTruncated ? 0x0200 : 0)
                              | (dnsResponse.RD ? 0x0100 : 0)
                              | (dnsResponse.RA ? 0x0080 : 0)
                              | (dnsResponse.Z << 4)
@@ -56,10 +100,10 @@ public sealed class DnsWriter(DnsResponse dnsResponse) : IDisposable
         BinaryPrimitives.WriteUInt16BigEndian(bytes.AsSpan(2, 2), flags);
 
         // Question Count
-        BinaryPrimitives.WriteUInt16BigEndian(bytes.AsSpan(4, 2), dnsResponse.QDCount);
+        BinaryPrimitives.WriteUInt16BigEndian(bytes.AsSpan(4, 2), questionCount);
 
         // Answer Record Count
-        BinaryPrimitives.WriteUInt16BigEndian(bytes.AsSpan(6, 2), dnsResponse.ANCount);
+        BinaryPrimitives.WriteUInt16BigEndian(bytes.AsSpan(6, 2), answerCount);
 
         // Authority Record Count
         BinaryPrimitives.WriteUInt16BigEndian(bytes.AsSpan(8, 2), dnsResponse.NSCount);

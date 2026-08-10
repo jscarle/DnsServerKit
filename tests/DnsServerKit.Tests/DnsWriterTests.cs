@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.Net;
 using DnsServerKit.Parameters;
 using DnsServerKit.Queries;
 using DnsServerKit.ResourceRecords;
@@ -9,6 +10,79 @@ namespace DnsServerKit.Tests;
 
 public sealed class DnsWriterTests
 {
+    [Fact]
+    public void GetBytes_WhenResponseExceedsUdpLimit_TruncatesAtRecordBoundaryAndSetsTC()
+    {
+        const string ownerName = "example.com";
+        var question = new DnsQuestion
+        {
+            Name = ownerName,
+            Type = RecordType.A,
+            Class = DnsClass.Internet,
+        };
+        var query = new DnsQuery(
+            0x1234,
+            false,
+            DnsOperation.Query,
+            false,
+            false,
+            false,
+            false,
+            0,
+            ResponseCode.NoError,
+            1,
+            0,
+            0,
+            0,
+            [question]);
+        var ipAddress = IPAddress.Parse("192.0.2.1");
+        var answers = new List<IResourceRecord>(100);
+        for (var answerIndex = 0; answerIndex < 100; answerIndex++)
+        {
+            answers.Add(new ARecord
+            {
+                Name = ownerName,
+                IpAddress = ipAddress,
+            });
+        }
+
+        var response = new DnsResponse(query, false, true, answers);
+        using var writer = new DnsWriter(response);
+
+        var bytes = writer.GetBytes().ToArray();
+
+        var flags = BinaryPrimitives.ReadUInt16BigEndian(bytes.AsSpan(2, 2));
+        var questionCount = BinaryPrimitives.ReadUInt16BigEndian(bytes.AsSpan(4, 2));
+        var answerCount = BinaryPrimitives.ReadUInt16BigEndian(bytes.AsSpan(6, 2));
+        Assert.True(bytes.Length <= 512);
+        Assert.True((flags & 0x0200) != 0);
+        Assert.Equal((ushort)1, questionCount);
+        Assert.InRange(answerCount, (ushort)1, (ushort)99);
+
+        var offset = 12;
+        for (var questionIndex = 0; questionIndex < questionCount; questionIndex++)
+        {
+            var serializedQuestionName = NameHelper.DecodeDnsName(bytes, ref offset);
+            Assert.Equal(ownerName, serializedQuestionName);
+            offset += 4;
+        }
+
+        for (var answerIndex = 0; answerIndex < answerCount; answerIndex++)
+        {
+            var serializedAnswerName = NameHelper.DecodeDnsName(bytes, ref offset);
+            Assert.Equal(ownerName, serializedAnswerName);
+
+            var answerType = BinaryPrimitives.ReadUInt16BigEndian(bytes.AsSpan(offset, 2));
+            Assert.Equal((ushort)RecordType.A, answerType);
+            offset += 8;
+
+            var resourceDataLength = BinaryPrimitives.ReadUInt16BigEndian(bytes.AsSpan(offset, 2));
+            offset += 2 + resourceDataLength;
+        }
+
+        Assert.Equal(bytes.Length, offset);
+    }
+
     [Fact]
     public void GetBytes_WhenNameUsesRootTrailingDotOrEscapedOctets_WritesCanonicalWireName()
     {
