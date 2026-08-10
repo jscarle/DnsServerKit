@@ -1,0 +1,69 @@
+using Xunit;
+
+namespace DnsServerKit.Tests;
+
+public sealed class DnsReaderTests
+{
+    [Fact]
+    public void DecodeDnsName_WhenPointerReferencesPriorName_DecodesNameAndAdvancesPastPointer()
+    {
+        byte[] packet =
+        [
+            0x03, (byte)'w', (byte)'w', (byte)'w', 0x00,
+            0xC0, 0x00,
+        ];
+        var offset = 5;
+
+        var name = NameHelper.DecodeDnsName(packet, ref offset);
+
+        Assert.Equal("www", name);
+        Assert.Equal(7, offset);
+    }
+
+    [Fact]
+    public void TryReadBytes_WhenNamePointerReferencesItself_ReturnsFailure()
+    {
+        byte[] dnsQuery =
+        [
+            0x12, 0x34,
+            0x00, 0x00,
+            0x00, 0x01,
+            0x00, 0x00,
+            0x00, 0x00,
+            0x00, 0x00,
+            0xC0, 0x0C,
+            0x00, 0x01,
+            0x00, 0x01,
+        ];
+
+        var result = DnsReader.TryReadBytes(dnsQuery);
+
+        Assert.True(result.IsFailure(out _, out _));
+    }
+
+    [Fact]
+    public void TryReadBytes_WhenReceivedDatagramEndsInsideName_DoesNotReadRemainingBufferBytes()
+    {
+        byte[] receiveBuffer =
+        [
+            0x12, 0x34,
+            0x00, 0x00,
+            0x00, 0x01,
+            0x00, 0x00,
+            0x00, 0x00,
+            0x00, 0x00,
+            0x03, (byte)'w', (byte)'w', (byte)'w',
+            0x00,
+            0x00, 0x01,
+            0x00, 0x01,
+        ];
+        const int receivedBytes = 16;
+        var receivedDatagram = receiveBuffer.AsMemory(0, receivedBytes);
+
+        var fullBufferResult = DnsReader.TryReadBytes(receiveBuffer);
+        var receivedDatagramResult = DnsReader.TryReadBytes(receivedDatagram);
+
+        Assert.False(fullBufferResult.IsFailure(out _, out _));
+        Assert.True(receivedDatagramResult.IsFailure(out _, out _));
+    }
+}
