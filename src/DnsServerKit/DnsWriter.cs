@@ -108,10 +108,25 @@ public sealed class DnsWriter(DnsResponse dnsResponse) : IDisposable
         ArrayPool<byte>.Shared.Return(bytes);
     }
 
-    private static void WriteAnswerData(MemoryStream memoryStream, IResourceRecord answer)
+    private void WriteAnswerData(MemoryStream memoryStream, IResourceRecord answer)
     {
         if (answer is ARecord aRecord)
             WriteARecord(memoryStream, aRecord);
+
+        if (answer is PtrRecord ptrRecord)
+        {
+            var resourceDataLengthPosition = memoryStream.Position;
+            WriteLength(memoryStream, 0);
+
+            var resourceDataStartPosition = memoryStream.Position;
+            WriteName(memoryStream, ptrRecord.TargetName);
+            var resourceDataEndPosition = memoryStream.Position;
+            var resourceDataLength = checked((ushort)(resourceDataEndPosition - resourceDataStartPosition));
+
+            memoryStream.Position = resourceDataLengthPosition;
+            WriteLength(memoryStream, resourceDataLength);
+            memoryStream.Position = resourceDataEndPosition;
+        }
     }
 
     private static void WriteARecord(MemoryStream memoryStream, ARecord aRecord)

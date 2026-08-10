@@ -117,7 +117,8 @@ public sealed class DnsServer(IMemoryCache memoryCache, ILogger<DnsServer> logge
             {
                 answers.Add(new PtrRecord
                 {
-                    Name = "localhost",
+                    Name = question.Name,
+                    TargetName = "localhost",
                 });
             }
         }
