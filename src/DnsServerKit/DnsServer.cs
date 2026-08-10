@@ -73,7 +73,28 @@ public sealed class DnsServer(IMemoryCache memoryCache, ILogger<DnsServer> logge
                 var receivedDatagram = receiveBuffer[..receiveResult.ReceivedBytes];
                 if (DnsReader.TryReadBytes(receivedDatagram).IsFailure(out var error, out var dnsQuery))
                 {
-                    logger.LogError("{Error}", error.Message);
+                    if (error is not DnsReadError dnsReadError)
+                    {
+                        logger.LogError("{Error}", error.Message);
+                        continue;
+                    }
+
+                    if (dnsReadError.Response is { ResponseCode: ResponseCode.ServerFailure })
+                        logger.LogError(error.Exception, "{Error}", error.Message);
+                    else
+                        logger.LogDebug("{Error}", error.Message);
+
+                    if (dnsReadError.Response is not { } errorResponse)
+                        continue;
+
+                    var errorResponseLength = DnsWriter.WriteErrorResponse(receiveBuffer.Span, errorResponse, true);
+                    var errorResponseBuffer = receiveBuffer[..errorResponseLength];
+                    await _udpSocket.SendToAsync(
+                        errorResponseBuffer,
+                        SocketFlags.None,
+                        receiveResult.RemoteEndPoint,
+                        cancellationToken);
+
                     continue;
                 }
                 

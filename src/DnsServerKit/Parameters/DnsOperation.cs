@@ -1,6 +1,7 @@
 ﻿namespace DnsServerKit.Parameters;
 
-/// <summary><c>DNS OpCodes</c> Represents the operational codes for DNS messages.</summary>
+/// <summary>Provides registered <c>DNS OpCode</c> values for DNS messages.</summary>
+/// <remarks>DNS OpCode values are extensible. Values not listed here remain valid wire values and must be preserved.</remarks>
 public enum DnsOperation : byte
 {
     /// <summary><c>Query</c> Represents a standard query.</summary>

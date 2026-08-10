@@ -57,12 +57,18 @@ public static class NameHelper
                 continue;
             }
 
+            if ((length & 0xC0) != 0)
+                throw new FormatException("The DNS label uses a reserved length prefix.");
+
             // Move to the next label part
             currentOffset++;
             if (nameBuilder.Length > 0)
             {
                 nameBuilder.Append('.');
             }
+
+            if (length > span.Length - currentOffset)
+                throw new FormatException("The DNS label is truncated.");
 
             var slice = span.Slice(currentOffset, length);
             var str = Encoding.ASCII.GetString(slice);

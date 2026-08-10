@@ -88,6 +88,41 @@ public sealed class DnsWriter(DnsResponse dnsResponse) : IDisposable
         return memory;
     }
 
+    /// <summary>Writes a minimal DNS error response into the specified destination.</summary>
+    /// <param name="destination">The destination that receives the 12-byte DNS response header.</param>
+    /// <param name="errorResponse">The trusted request header values and response code.</param>
+    /// <param name="recursionAvailable">Whether the responding server supports recursive queries.</param>
+    /// <returns>The number of bytes written.</returns>
+    public static int WriteErrorResponse(
+        Span<byte> destination,
+        DnsErrorResponse errorResponse,
+        bool recursionAvailable)
+    {
+        const int headerLength = 12;
+        if (destination.Length < headerLength)
+            throw new ArgumentException("The destination must contain at least 12 bytes.", nameof(destination));
+
+        var operation = (byte)errorResponse.Operation;
+        if (operation > 0x0F)
+            throw new ArgumentOutOfRangeException(nameof(errorResponse), "The DNS operation must fit in the four-bit OpCode field.");
+
+        var responseCode = (byte)errorResponse.ResponseCode;
+        if (responseCode > 0x0F)
+            throw new NotSupportedException("Extended DNS response codes require an OPT record and are not supported by this writer.");
+
+        destination[..headerLength].Clear();
+        BinaryPrimitives.WriteUInt16BigEndian(destination, errorResponse.TransactionId);
+
+        var flags = (ushort)(0x8000
+                             | (operation << 11)
+                             | (errorResponse.RecursionDesired ? 0x0100 : 0)
+                             | (recursionAvailable ? 0x0080 : 0)
+                             | responseCode);
+        BinaryPrimitives.WriteUInt16BigEndian(destination[2..], flags);
+
+        return headerLength;
+    }
+
     private static void WriteHeader(
         MemoryStream memoryStream,
         DnsResponse dnsResponse,

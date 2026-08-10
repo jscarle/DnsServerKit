@@ -379,4 +379,104 @@ public sealed class DnsWriterTests
         Assert.Equal(targetName, ptrTargetName);
         Assert.Equal(bytes.Length, offset);
     }
+
+    [Theory]
+    [InlineData(ResponseCode.FormatError)]
+    [InlineData(ResponseCode.NotImplemented)]
+    [InlineData(ResponseCode.ServerFailure)]
+    public void WriteErrorResponse_WhenResponseCodeIsSupported_WritesMinimalHeader(ResponseCode responseCode)
+    {
+        var destination = new byte[12];
+        var errorResponse = new DnsErrorResponse(
+            0x1234,
+            (DnsOperation)15,
+            true,
+            responseCode);
+
+        var writtenBytes = DnsWriter.WriteErrorResponse(destination, errorResponse, true);
+
+        var transactionId = BinaryPrimitives.ReadUInt16BigEndian(destination);
+        var flags = BinaryPrimitives.ReadUInt16BigEndian(destination.AsSpan(2));
+        var expectedFlags = (ushort)(0x8000 | 0x7800 | 0x0100 | 0x0080 | (byte)responseCode);
+        Assert.Equal(12, writtenBytes);
+        Assert.Equal((ushort)0x1234, transactionId);
+        Assert.Equal(expectedFlags, flags);
+        Assert.Equal(0U, BinaryPrimitives.ReadUInt32BigEndian(destination.AsSpan(4)));
+        Assert.Equal(0U, BinaryPrimitives.ReadUInt32BigEndian(destination.AsSpan(8)));
+    }
+
+    [Fact]
+    public void WriteErrorResponse_WhenCalled_DoesNotAllocate()
+    {
+        var destination = new byte[12];
+        var errorResponse = new DnsErrorResponse(
+            0x1234,
+            DnsOperation.Query,
+            false,
+            ResponseCode.FormatError);
+        _ = DnsWriter.WriteErrorResponse(destination, errorResponse, true);
+
+        var allocatedBytesBefore = GC.GetAllocatedBytesForCurrentThread();
+        _ = DnsWriter.WriteErrorResponse(destination, errorResponse, true);
+        var allocatedBytes = GC.GetAllocatedBytesForCurrentThread() - allocatedBytesBefore;
+
+        Assert.Equal(0L, allocatedBytes);
+    }
+
+    [Fact]
+    public void WriteErrorResponse_WhenGivenReaderFailures_WritesExpectedResponseCodes()
+    {
+        var malformedQuery = new byte[12];
+        BinaryPrimitives.WriteUInt16BigEndian(malformedQuery, 0x1234);
+        var malformedResult = DnsReader.TryReadBytes(malformedQuery);
+        Assert.True(malformedResult.IsFailure(out var malformedError, out _));
+        var malformedReadError = Assert.IsType<DnsReadError>(malformedError);
+
+        var unsupportedQuery = new byte[12];
+        BinaryPrimitives.WriteUInt16BigEndian(unsupportedQuery, 0x5678);
+        BinaryPrimitives.WriteUInt16BigEndian(unsupportedQuery.AsSpan(2), 0x7800);
+        var unsupportedResult = DnsReader.TryReadBytes(unsupportedQuery);
+        Assert.True(unsupportedResult.IsFailure(out var unsupportedError, out _));
+        var unsupportedReadError = Assert.IsType<DnsReadError>(unsupportedError);
+
+        var serverFailureResponse = new DnsErrorResponse(
+            0x9ABC,
+            DnsOperation.Query,
+            false,
+            ResponseCode.ServerFailure);
+        var serverReadError = new DnsReadError(
+            "Unexpected failure.",
+            new InvalidOperationException("Test exception."),
+            serverFailureResponse);
+        DnsReadError[] readErrors =
+        [
+            malformedReadError,
+            unsupportedReadError,
+            serverReadError,
+        ];
+        ResponseCode[] expectedResponseCodes =
+        [
+            ResponseCode.FormatError,
+            ResponseCode.NotImplemented,
+            ResponseCode.ServerFailure,
+        ];
+
+        for (var errorIndex = 0; errorIndex < readErrors.Length; errorIndex++)
+        {
+            var errorResponse = readErrors[errorIndex].Response;
+            Assert.True(errorResponse.HasValue);
+            var destination = new byte[12];
+
+            var writtenBytes = DnsWriter.WriteErrorResponse(
+                destination,
+                errorResponse.GetValueOrDefault(),
+                true);
+
+            var flags = BinaryPrimitives.ReadUInt16BigEndian(destination.AsSpan(2));
+            Assert.Equal(12, writtenBytes);
+            Assert.Equal((ushort)expectedResponseCodes[errorIndex], (ushort)(flags & 0x000F));
+        }
+
+        Assert.IsType<InvalidOperationException>(serverReadError.Exception);
+    }
 }

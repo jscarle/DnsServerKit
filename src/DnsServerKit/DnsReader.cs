@@ -1,5 +1,7 @@
-﻿using DnsServerKit.Parameters;
+using System.Buffers.Binary;
+using DnsServerKit.Parameters;
 using DnsServerKit.Queries;
+using DnsServerKit.Responses;
 using LightResults;
 
 namespace DnsServerKit;
@@ -11,96 +13,169 @@ public sealed class DnsReader
     /// <returns>Returns a result containing the created <see cref="DnsQuery"/> if the creation succeeded, or an error if it failed.</returns>
     public static Result<DnsQuery> TryReadBytes(Memory<byte> memory)
     {
-        if (memory.Length < 16)
+        const int headerLength = 12;
+        if (memory.Length < headerLength)
         {
-            Result.Failure<DnsQuery>("Could not process the DNS query. Received less than 16 bytes of data.");
+            var error = new DnsReadError("Could not process the DNS query. The DNS header is truncated.");
+            return Result.Failure<DnsQuery>(error);
+        }
+
+        var span = memory.Span;
+        var transactionId = BinaryPrimitives.ReadUInt16BigEndian(span);
+        var flags = BinaryPrimitives.ReadUInt16BigEndian(span[2..]);
+        var operation = (DnsOperation)((flags & 0x7800) >> 11);
+        var recursionDesired = (flags & 0x0100) != 0;
+
+        if ((flags & 0x8000) != 0)
+        {
+            var error = new DnsReadError("Could not process the DNS query. The message is a response.");
+            return Result.Failure<DnsQuery>(error);
+        }
+
+        if (operation != DnsOperation.Query)
+        {
+            var response = new DnsErrorResponse(
+                transactionId,
+                operation,
+                recursionDesired,
+                ResponseCode.NotImplemented);
+            var error = new DnsReadError("Could not process the DNS query. The operation is not implemented.", response);
+
+            return Result.Failure<DnsQuery>(error);
+        }
+
+        var formatErrorResponse = new DnsErrorResponse(
+            transactionId,
+            operation,
+            recursionDesired,
+            ResponseCode.FormatError);
+
+        var authoritativeAnswer = (flags & 0x0400) != 0;
+        if (authoritativeAnswer)
+        {
+            var error = new DnsReadError("Could not process the DNS query. The AA flag is invalid in a query.", formatErrorResponse);
+            return Result.Failure<DnsQuery>(error);
+        }
+
+        var recursionAvailable = (flags & 0x0080) != 0;
+        if (recursionAvailable)
+        {
+            var error = new DnsReadError("Could not process the DNS query. The RA flag is invalid in a query.", formatErrorResponse);
+            return Result.Failure<DnsQuery>(error);
+        }
+
+        var reservedFlag = (flags & 0x0040) != 0;
+        if (reservedFlag)
+        {
+            var error = new DnsReadError("Could not process the DNS query. The reserved Z flag is not zero.", formatErrorResponse);
+            return Result.Failure<DnsQuery>(error);
+        }
+
+        var responseCode = (byte)(flags & 0x000F);
+        if (responseCode != 0)
+        {
+            var error = new DnsReadError("Could not process the DNS query. The response code is not zero.", formatErrorResponse);
+            return Result.Failure<DnsQuery>(error);
+        }
+
+        var questionCount = BinaryPrimitives.ReadUInt16BigEndian(span[4..]);
+        if (questionCount != 1)
+        {
+            var error = new DnsReadError("Could not process the DNS query. QDCOUNT must be one.", formatErrorResponse);
+            return Result.Failure<DnsQuery>(error);
+        }
+
+        var answerCount = BinaryPrimitives.ReadUInt16BigEndian(span[6..]);
+        if (answerCount != 0)
+        {
+            var error = new DnsReadError("Could not process the DNS query. ANCOUNT must be zero.", formatErrorResponse);
+            return Result.Failure<DnsQuery>(error);
+        }
+
+        var authorityCount = BinaryPrimitives.ReadUInt16BigEndian(span[8..]);
+        if (authorityCount != 0)
+        {
+            var error = new DnsReadError("Could not process the DNS query. NSCOUNT must be zero.", formatErrorResponse);
+            return Result.Failure<DnsQuery>(error);
+        }
+
+        var additionalCount = BinaryPrimitives.ReadUInt16BigEndian(span[10..]);
+        if (additionalCount != 0)
+        {
+            var error = new DnsReadError("Could not process the DNS query. ARCOUNT must be zero.", formatErrorResponse);
+            return Result.Failure<DnsQuery>(error);
         }
 
         try
         {
-            var span = memory.Span;
-
-            var id = (ushort)((span[0] << 8) | span[1]);
-
-            var qr = (span[2] & 0x80) != 0;
-            if (qr)
-                Result.Failure<DnsQuery>("Could not process the DNS query. Invalid QR.");
-
-            var opCode = (byte)((span[2] & 0x78) >> 3);
-            if (!Enum.IsDefined(typeof(DnsOperation), opCode))
-                Result.Failure<DnsQuery>("Could not process the DNS query. Invalid OpCode.");
-
-            var aa = (span[2] & 0x04) != 0;
-            if (aa)
-                Result.Failure<DnsQuery>("Could not process the DNS query. Invalid AA.");
-
-            var tc = (span[2] & 0x02) != 0;
-
-            var rd = (span[2] & 0x01) != 0;
-            
-            var ra = (span[3] & 0x80) != 0;
-            if (ra)
-                Result.Failure<DnsQuery>("Could not process the DNS query. Invalid RA.");
-            
-            var z = (byte)((span[3] & 0x70) >> 4);
-            if (z > 0)
-                Result.Failure<DnsQuery>("Could not process the DNS query. Invalid Z.");
-
-            var rCode = (byte)(span[3] & 0x0F);
-            if (rCode > 0)
-                Result.Failure<DnsQuery>("Could not process the DNS query. Invalid RCode.");
-
-            var qdCount = (ushort)((span[4] << 8) | span[5]);
-            if (qdCount == 0)
-                Result.Failure<DnsQuery>("Could not process the DNS query. QDCount is 0.");
-
-            var anCount = (ushort)((span[6] << 8) | span[7]);
-            if (anCount > 0)
-                Result.Failure<DnsQuery>("Could not process the DNS query. Invalid ANCount.");
-
-            var nsCount = (ushort)((span[8] << 8) | span[9]);
-            if (nsCount > 0)
-                Result.Failure<DnsQuery>("Could not process the DNS query. Invalid NSCount.");
-            
-            var arCount = (ushort)((span[10] << 8) | span[11]);
-            if (arCount > 0)
-                Result.Failure<DnsQuery>("Could not process the DNS query. Invalid ARCount.");
-
-            
-            var questions = new List<DnsQuestion>(qdCount);
-            var offset = 12;
-            for (var i = 0; i < qdCount; i++)
+            var questions = new List<DnsQuestion>(1);
+            var offset = headerLength;
+            var name = NameHelper.DecodeDnsName(span, ref offset);
+            if (span.Length - offset < 4)
             {
-                var name = NameHelper.DecodeDnsName(span, ref offset);
-                if (offset + 4 > span.Length)
-                {
-                    Result.Failure<DnsQuery>("Could not process the DNS query. Data was truncated.");
-                }
-
-                var type = (ushort)((span[offset] << 8) | span[offset + 1]);
-                var @class = (ushort)((span[offset + 2] << 8) | span[offset + 3]);
-
-                if (!Enum.IsDefined(typeof(DnsClass), @class))
-                    Result.Failure<DnsQuery>("Could not process the DNS query. Invalid Class.");
-
-                var question = new DnsQuestion
-                {
-                    Name = name,
-                    Type = (RecordType)type,
-                    Class = (DnsClass)@class,
-                };
-                questions.Add(question);
-
-                offset += 4;
+                var error = new DnsReadError("Could not process the DNS query. The question is truncated.", formatErrorResponse);
+                return Result.Failure<DnsQuery>(error);
             }
 
-            var dnsQuery = new DnsQuery(id, qr, (DnsOperation)opCode, aa, tc, rd, ra, z, (ResponseCode)rCode, qdCount, anCount, nsCount, arCount, questions);
+            var type = BinaryPrimitives.ReadUInt16BigEndian(span[offset..]);
+            var @class = BinaryPrimitives.ReadUInt16BigEndian(span[(offset + 2)..]);
+            offset += 4;
+
+            if (offset != span.Length)
+            {
+                var error = new DnsReadError("Could not process the DNS query. The message contains uncounted trailing data.", formatErrorResponse);
+                return Result.Failure<DnsQuery>(error);
+            }
+
+            var question = new DnsQuestion
+            {
+                Name = name,
+                Type = (RecordType)type,
+                Class = (DnsClass)@class,
+            };
+            questions.Add(question);
+
+            var truncated = (flags & 0x0200) != 0;
+            var dnsQuery = new DnsQuery(
+                transactionId,
+                false,
+                operation,
+                false,
+                truncated,
+                recursionDesired,
+                false,
+                0,
+                ResponseCode.NoError,
+                questionCount,
+                answerCount,
+                authorityCount,
+                additionalCount,
+                questions);
 
             return Result.Success(dnsQuery);
         }
-        catch (Exception ex)
+        catch (FormatException exception)
         {
-            return Result.Failure<DnsQuery>("Could not process the DNS query. An exception occured.", ("Exception", ex));
+            var error = new DnsReadError(
+                "Could not process the DNS query. The question format is invalid.",
+                exception,
+                formatErrorResponse);
+
+            return Result.Failure<DnsQuery>(error);
+        }
+        catch (Exception exception)
+        {
+            var serverFailureResponse = new DnsErrorResponse(
+                transactionId,
+                operation,
+                recursionDesired,
+                ResponseCode.ServerFailure);
+            var error = new DnsReadError(
+                "Could not process the DNS query because of an unexpected error.",
+                exception,
+                serverFailureResponse);
+
+            return Result.Failure<DnsQuery>(error);
         }
     }
 }
