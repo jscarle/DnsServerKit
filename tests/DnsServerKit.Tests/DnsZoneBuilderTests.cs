@@ -241,12 +241,6 @@ public sealed class DnsZoneBuilderTests
             Ttl = 300,
             Records = [new PtrRecord { Target = "invalid..example" }],
         }));
-        Assert.Throws<ArgumentException>(() => builder.AddRecordSet(new NsRecordSet
-        {
-            Name = "delegation",
-            Ttl = 300,
-            Records = [new NsRecord { NameServer = "ns1.example.com" }],
-        }));
         Assert.Throws<ArgumentException>(() => builder.AddRecordSet(new SoaRecordSet
         {
             Name = "@",

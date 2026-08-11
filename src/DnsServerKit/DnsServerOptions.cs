@@ -15,5 +15,9 @@ public sealed class DnsServerOptions
 
     public TimeSpan StatisticsInterval { get; init; } = TimeSpan.FromSeconds(10);
 
-    public bool RecursionAvailable { get; init; } = true;
+    /// <summary>
+    /// Retained for source compatibility. <see cref="DnsServer"/> is authoritative-only and always reports recursion as unavailable.
+    /// </summary>
+    // ReSharper disable once UnusedAutoPropertyAccessor.Global -- The init accessor is part of the compatibility surface.
+    public bool RecursionAvailable { get; init; }
 }

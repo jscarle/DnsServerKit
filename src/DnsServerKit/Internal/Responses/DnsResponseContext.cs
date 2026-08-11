@@ -1,5 +1,6 @@
 using DnsServerKit.Internal.Protocol;
 using DnsServerKit.Internal.Queries;
+using DnsServerKit.Internal.Lookup;
 using DnsServerKit.Records;
 
 namespace DnsServerKit.Internal.Responses;
@@ -17,6 +18,8 @@ internal sealed class DnsResponseContext
 
     public RecordSet? AnswerSet { get; private set; }
 
+    public DnsResolutionContext? Resolution { get; private set; }
+
     public void Set(DnsQueryContext query, RecordSet? answerSet, ResponseCode responseCode, bool authoritativeAnswer, bool recursionAvailable)
     {
         ArgumentNullException.ThrowIfNull(query);
@@ -28,6 +31,20 @@ internal sealed class DnsResponseContext
         ResponseCode = responseCode;
         AuthoritativeAnswer = authoritativeAnswer;
         RecursionAvailable = recursionAvailable;
+        Resolution = null;
+    }
+
+    public void Set(DnsQueryContext query, DnsResolutionContext resolution)
+    {
+        ArgumentNullException.ThrowIfNull(query);
+        ArgumentNullException.ThrowIfNull(resolution);
+
+        Query = query;
+        AnswerSet = resolution.AnswerSetCount == 1 ? resolution.GetAnswerSet(0).RecordSet : null;
+        ResponseCode = resolution.ResponseCode;
+        AuthoritativeAnswer = resolution.AuthoritativeAnswer;
+        RecursionAvailable = false;
+        Resolution = resolution;
     }
 
     public DnsResponse Materialize()

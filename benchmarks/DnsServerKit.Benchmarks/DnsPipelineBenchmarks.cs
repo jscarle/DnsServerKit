@@ -1,6 +1,7 @@
 using System.Buffers.Binary;
 using System.Text;
 using BenchmarkDotNet.Attributes;
+using DnsServerKit.Internal.Lookup;
 using DnsServerKit.Internal.Protocol;
 using DnsServerKit.Internal.Queries;
 using DnsServerKit.Internal.Responses;
@@ -16,8 +17,14 @@ public class DnsPipelineBenchmarks
 {
     private readonly byte[] _buffer = new byte[512];
     private readonly DnsQueryContext _query = new();
+    private readonly DnsResolutionContext _resolution = new();
     private readonly DnsResponseContext _response = new();
+    private byte[] _anyQueryBytes = null!;
+    private byte[] _cnameQueryBytes = null!;
+    private byte[] _noDataQueryBytes = null!;
+    private byte[] _nxDomainQueryBytes = null!;
     private byte[] _queryBytes = null!;
+    private byte[] _referralQueryBytes = null!;
     private DnsZoneStore _store = null!;
     private Dictionary<string, int> _stringLookup = null!;
 
@@ -67,19 +74,27 @@ public class DnsPipelineBenchmarks
             queriedName = dnsName;
         }
 
+        var queryName = queriedName ?? throw new InvalidOperationException("The benchmark zone is empty.");
+        zoneBuilder.AddCnameRecord(300, "alias", queryName.Value);
+        zoneBuilder.AddRecordSet(new NsRecordSet
+        {
+            Name = "child",
+            Ttl = 300,
+            Records = [new NsRecord { NameServer = "ns1.child.example.com" }],
+        });
+        zoneBuilder.AddARecord(300, "ns1.child", "192.0.2.2");
+
         var zoneSetBuilder = new DnsZoneSetBuilder();
         zoneSetBuilder.Load(zoneBuilder);
         var zoneSet = zoneSetBuilder.Build();
         _store = new DnsZoneStore();
         _store.Load(zoneSet);
-        var queryName = queriedName ?? throw new InvalidOperationException("The benchmark zone is empty.");
-        var wireName = queryName.WireBytes;
-        _queryBytes = new byte[12 + wireName.Length + 4];
-        BinaryPrimitives.WriteUInt16BigEndian(_queryBytes, 0x1234);
-        BinaryPrimitives.WriteUInt16BigEndian(_queryBytes.AsSpan(4), 1);
-        wireName.CopyTo(_queryBytes.AsSpan(12));
-        BinaryPrimitives.WriteUInt16BigEndian(_queryBytes.AsSpan(12 + wireName.Length), (ushort)RecordType.A);
-        BinaryPrimitives.WriteUInt16BigEndian(_queryBytes.AsSpan(14 + wireName.Length), (ushort)DnsClass.Internet);
+        _queryBytes = CreateQuery(queryName, RecordType.A);
+        _noDataQueryBytes = CreateQuery(queryName, RecordType.Aaaa);
+        _nxDomainQueryBytes = CreateQuery(new DnsName("missing.example.com"), RecordType.A);
+        _anyQueryBytes = CreateQuery(queryName, RecordType.All);
+        _cnameQueryBytes = CreateQuery(new DnsName("alias.example.com"), RecordType.A);
+        _referralQueryBytes = CreateQuery(new DnsName("www.child.example.com"), RecordType.A);
         _queryBytes.AsSpan().CopyTo(_buffer);
         _ = DnsReader.Read(_buffer.AsMemory(0, _queryBytes.Length), _query);
     }
@@ -101,13 +116,49 @@ public class DnsPipelineBenchmarks
         return _stringLookup.TryGetValue(key, out _);
     }
 
-    [Benchmark]
+    [Benchmark(Baseline = true)]
     public int ParseLookupWrite()
     {
         _queryBytes.AsSpan().CopyTo(_buffer);
         _ = DnsReader.Read(_buffer.AsMemory(0, _queryBytes.Length), _query);
-        _ = _store.TryResolve(_query.Question, out var answerSet);
-        _response.Set(_query, answerSet, ResponseCode.NoError, false, true);
+        _store.Resolve(_query.Question, _resolution);
+        _response.Set(_query, _resolution);
         return DnsWriter.Write(_buffer, _response);
+    }
+
+    [Benchmark]
+    public int ParseLookupWriteNoData() => ParseLookupWrite(_noDataQueryBytes);
+
+    [Benchmark]
+    public int ParseLookupWriteNxDomain() => ParseLookupWrite(_nxDomainQueryBytes);
+
+    [Benchmark]
+    public int ParseLookupWriteAny() => ParseLookupWrite(_anyQueryBytes);
+
+    [Benchmark]
+    public int ParseLookupWriteCname() => ParseLookupWrite(_cnameQueryBytes);
+
+    [Benchmark]
+    public int ParseLookupWriteReferral() => ParseLookupWrite(_referralQueryBytes);
+
+    private int ParseLookupWrite(byte[] queryBytes)
+    {
+        queryBytes.AsSpan().CopyTo(_buffer);
+        _ = DnsReader.Read(_buffer.AsMemory(0, queryBytes.Length), _query);
+        _store.Resolve(_query.Question, _resolution);
+        _response.Set(_query, _resolution);
+        return DnsWriter.Write(_buffer, _response);
+    }
+
+    private static byte[] CreateQuery(DnsName name, RecordType type)
+    {
+        var wireName = name.WireBytes;
+        var queryBytes = new byte[12 + wireName.Length + 4];
+        BinaryPrimitives.WriteUInt16BigEndian(queryBytes, 0x1234);
+        BinaryPrimitives.WriteUInt16BigEndian(queryBytes.AsSpan(4), 1);
+        wireName.CopyTo(queryBytes.AsSpan(12));
+        BinaryPrimitives.WriteUInt16BigEndian(queryBytes.AsSpan(12 + wireName.Length), (ushort)type);
+        BinaryPrimitives.WriteUInt16BigEndian(queryBytes.AsSpan(14 + wireName.Length), (ushort)DnsClass.Internet);
+        return queryBytes;
     }
 }

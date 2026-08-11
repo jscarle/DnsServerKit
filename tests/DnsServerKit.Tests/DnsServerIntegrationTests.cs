@@ -80,7 +80,10 @@ public sealed class DnsServerIntegrationTests
                     Assert.Equal(transactionId, BinaryPrimitives.ReadUInt16BigEndian(response));
                     Assert.Equal((ushort)1, BinaryPrimitives.ReadUInt16BigEndian(response.AsSpan(4)));
                     Assert.Equal((ushort)1, BinaryPrimitives.ReadUInt16BigEndian(response.AsSpan(6)));
-                    Assert.Equal((ushort)0, (ushort)(BinaryPrimitives.ReadUInt16BigEndian(response.AsSpan(2)) & 0x000F));
+                    var flags = BinaryPrimitives.ReadUInt16BigEndian(response.AsSpan(2));
+                    Assert.Equal((ushort)0, (ushort)(flags & 0x000F));
+                    Assert.NotEqual((ushort)0, (ushort)(flags & 0x0400));
+                    Assert.Equal((ushort)0, (ushort)(flags & 0x0080));
                 }
             }, timeoutToken);
         }

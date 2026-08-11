@@ -31,7 +31,7 @@ public sealed class DnsWriterTests
 
         Assert.Equal(queryBytes.Length + 16, length);
         Assert.Equal((ushort)0x1234, BinaryPrimitives.ReadUInt16BigEndian(buffer));
-        Assert.Equal((ushort)0x8180, BinaryPrimitives.ReadUInt16BigEndian(buffer.AsSpan(2)));
+        Assert.Equal((ushort)0x8100, BinaryPrimitives.ReadUInt16BigEndian(buffer.AsSpan(2)));
         Assert.Equal((ushort)1, BinaryPrimitives.ReadUInt16BigEndian(buffer.AsSpan(4)));
         Assert.Equal((ushort)1, BinaryPrimitives.ReadUInt16BigEndian(buffer.AsSpan(6)));
         Assert.Equal((ushort)0xC00C, BinaryPrimitives.ReadUInt16BigEndian(buffer.AsSpan(queryBytes.Length)));
@@ -270,12 +270,12 @@ public sealed class DnsWriterTests
         var length = DnsWriter.Write(buffer, response);
 
         Assert.Equal(queryBytes.Length, length);
-        Assert.Equal((ushort)0x808A, BinaryPrimitives.ReadUInt16BigEndian(buffer.AsSpan(2)));
+        Assert.Equal((ushort)0x800A, BinaryPrimitives.ReadUInt16BigEndian(buffer.AsSpan(2)));
         Assert.Equal((ushort)0, BinaryPrimitives.ReadUInt16BigEndian(buffer.AsSpan(6)));
     }
 
     [Fact]
-    public void Write_WhenRecordSetExceedsUdpLimit_TruncatesAtRecordBoundary()
+    public void Write_WhenRecordSetExceedsUdpLimit_OmitsIncompleteRecordSetAndSetsTruncated()
     {
         var ipv4Addresses = new string[100];
         for (var recordIndex = 0; recordIndex < 100; recordIndex++)
@@ -299,8 +299,8 @@ public sealed class DnsWriterTests
 
         Assert.True(length <= 512);
         Assert.NotEqual((ushort)0, (ushort)(flags & 0x0200));
-        Assert.InRange(answerCount, (ushort)1, (ushort)99);
-        Assert.Equal(queryBytes.Length + (answerCount * 16), length);
+        Assert.Equal((ushort)0, answerCount);
+        Assert.Equal(queryBytes.Length, length);
     }
 
     [Theory]
@@ -313,10 +313,10 @@ public sealed class DnsWriterTests
         var destination = new byte[12];
         var errorResponse = new DnsErrorResponse(0x1234, 15, true, responseCode);
 
-        var writtenBytes = DnsWriter.WriteErrorResponse(destination, errorResponse, true);
+        var writtenBytes = DnsWriter.WriteErrorResponse(destination, errorResponse);
 
         var flags = BinaryPrimitives.ReadUInt16BigEndian(destination.AsSpan(2));
-        var expectedFlags = (ushort)(0x8000 | 0x7800 | 0x0100 | 0x0080 | (ushort)responseCode);
+        var expectedFlags = (ushort)(0x8000 | 0x7800 | 0x0100 | (ushort)responseCode);
         Assert.Equal(12, writtenBytes);
         Assert.Equal((ushort)0x1234, BinaryPrimitives.ReadUInt16BigEndian(destination));
         Assert.Equal(expectedFlags, flags);
@@ -329,10 +329,10 @@ public sealed class DnsWriterTests
     {
         var destination = new byte[12];
         var errorResponse = new DnsErrorResponse(0x1234, 0, false, ResponseCode.FormatError);
-        _ = DnsWriter.WriteErrorResponse(destination, errorResponse, true);
+        _ = DnsWriter.WriteErrorResponse(destination, errorResponse);
 
         var allocatedBytesBefore = GC.GetAllocatedBytesForCurrentThread();
-        var writtenBytes = DnsWriter.WriteErrorResponse(destination, errorResponse, true);
+        var writtenBytes = DnsWriter.WriteErrorResponse(destination, errorResponse);
         var allocatedBytes = GC.GetAllocatedBytesForCurrentThread() - allocatedBytesBefore;
 
         Assert.Equal(12, writtenBytes);
@@ -425,8 +425,8 @@ public sealed class DnsWriterTests
         var errorBuffer = new byte[12];
         var formatError = new DnsErrorResponse(0x1234, 0, false, ResponseCode.FormatError);
         var notImplemented = new DnsErrorResponse(0x5678, 15, true, ResponseCode.NotImplemented);
-        _ = DnsWriter.WriteErrorResponse(errorBuffer, formatError, true);
-        _ = DnsWriter.WriteErrorResponse(errorBuffer, notImplemented, true);
+        _ = DnsWriter.WriteErrorResponse(errorBuffer, formatError);
+        _ = DnsWriter.WriteErrorResponse(errorBuffer, notImplemented);
 
         var beforeResponseSet = GC.GetAllocatedBytesForCurrentThread();
         aResponse.Set(aQuery, aAnswerSet, ResponseCode.NoError, false, true);
@@ -445,11 +445,11 @@ public sealed class DnsWriterTests
         var missAllocations = GC.GetAllocatedBytesForCurrentThread() - beforeMiss;
 
         var beforeFormatError = GC.GetAllocatedBytesForCurrentThread();
-        var formatErrorLength = DnsWriter.WriteErrorResponse(errorBuffer, formatError, true);
+        var formatErrorLength = DnsWriter.WriteErrorResponse(errorBuffer, formatError);
         var formatErrorAllocations = GC.GetAllocatedBytesForCurrentThread() - beforeFormatError;
 
         var beforeNotImplemented = GC.GetAllocatedBytesForCurrentThread();
-        var notImplementedLength = DnsWriter.WriteErrorResponse(errorBuffer, notImplemented, true);
+        var notImplementedLength = DnsWriter.WriteErrorResponse(errorBuffer, notImplemented);
         var notImplementedAllocations = GC.GetAllocatedBytesForCurrentThread() - beforeNotImplemented;
 
         Assert.True(aLength > aQueryBytes.Length);

@@ -406,8 +406,6 @@ public sealed class DnsZoneBuilder
                 {
                     recordType = (ushort)RecordType.Ns;
                     ownerName = CreateOwnerName(nameServerRecordSet.Name);
-                    if (!nameServerRecordSet.Name.Equals("@", StringComparison.Ordinal))
-                        throw new ArgumentException("Only apex NS record sets are currently supported.", nameof(recordSet));
                     if (nameServerRecordSet.Records is null)
                         throw new ArgumentException("An NS record set requires records.", nameof(recordSet));
                     if (nameServerRecordSet.Records.Count == 0)

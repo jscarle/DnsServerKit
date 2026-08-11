@@ -3,6 +3,7 @@ using System.Net.Sockets;
 using DnsServerKit.Internal.Protocol;
 using DnsServerKit.Internal.Queries;
 using DnsServerKit.Internal.Responses;
+using DnsServerKit.Internal.Lookup;
 using DnsServerKit.Zones;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -75,6 +76,8 @@ public sealed partial class DnsServer : IHostedService, IAsyncDisposable
         }
 
         _statisticsTask = ReportStatisticsAsync(_workers, _stopSource.Token);
+        if (_options.RecursionAvailable)
+            LogRecursionOptionIgnored(_logger);
         LogServerStarted(_logger, BoundEndPoint, _workers.Length, socket.ReceiveBufferSize);
 
         return Task.CompletedTask;
@@ -143,7 +146,7 @@ public sealed partial class DnsServer : IHostedService, IAsyncDisposable
                         worker.Malformed++;
                     }
 
-                    var errorLength = DnsWriter.WriteErrorResponse(worker.Buffer, readResult.ErrorResponse, _options.RecursionAvailable);
+                    var errorLength = DnsWriter.WriteErrorResponse(worker.Buffer, readResult.ErrorResponse);
                     await socket.SendToAsync(worker.Buffer.AsMemory(0, errorLength), SocketFlags.None, worker.RemoteAddress, CancellationToken.None)
                         .ConfigureAwait(false);
                     worker.ResponsesSent++;
@@ -151,10 +154,8 @@ public sealed partial class DnsServer : IHostedService, IAsyncDisposable
                 }
 
                 hasTrustedQuery = true;
-                if (_zoneStore.TryResolve(worker.Query.Question, out var answerSet))
-                    worker.Response.Set(worker.Query, answerSet, ResponseCode.NoError, false, _options.RecursionAvailable);
-                else
-                    worker.Response.Set(worker.Query, null, ResponseCode.NotZone, false, _options.RecursionAvailable);
+                _zoneStore.Resolve(worker.Query.Question, worker.Resolution);
+                worker.Response.Set(worker.Query, worker.Resolution);
 
                 var responseLength = DnsWriter.Write(worker.Buffer, worker.Response);
                 if ((worker.Buffer[2] & 0x02) != 0)
@@ -190,7 +191,7 @@ public sealed partial class DnsServer : IHostedService, IAsyncDisposable
                     var serverFailureResponse = new DnsErrorResponse(worker.Query.TransactionId, worker.Query.Operation, worker.Query.RecursionDesired,
                         ResponseCode.ServerFailure
                     );
-                    var errorLength = DnsWriter.WriteErrorResponse(worker.Buffer, serverFailureResponse, _options.RecursionAvailable);
+                    var errorLength = DnsWriter.WriteErrorResponse(worker.Buffer, serverFailureResponse);
                     await socket.SendToAsync(worker.Buffer.AsMemory(0, errorLength), SocketFlags.None, worker.RemoteAddress, CancellationToken.None)
                         .ConfigureAwait(false);
                     worker.ResponsesSent++;
@@ -270,6 +271,10 @@ public sealed partial class DnsServer : IHostedService, IAsyncDisposable
     [LoggerMessage(EventId = 4, Level = LogLevel.Error, Message = "Unexpected DNS worker failure on worker {WorkerId}.")]
     private static partial void LogUnexpectedFailure(ILogger logger, Exception? exception, int workerId);
 
+    [LoggerMessage(EventId = 5, Level = LogLevel.Warning,
+        Message = "DnsServerOptions.RecursionAvailable is ignored because DnsServerKit provides authoritative-only DNS service.")]
+    private static partial void LogRecursionOptionIgnored(ILogger logger);
+
     private sealed class DnsWorker(int id)
     {
         public int Id { get; } = id;
@@ -281,6 +286,8 @@ public sealed partial class DnsServer : IHostedService, IAsyncDisposable
         public DnsQueryContext Query { get; } = new();
 
         public DnsResponseContext Response { get; } = new();
+
+        public DnsResolutionContext Resolution { get; } = new();
 
         public long Received;
         public long Answered;
