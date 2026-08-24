@@ -56,8 +56,13 @@ zoneSetBuilder.Load(reverseZoneBuilder);
 var zoneStore = new DnsZoneStore();
 zoneStore.Load(zoneSetBuilder.Build());
 
+var dnsOptions = new DnsServerOptions
+{
+    Port = 53,
+};
+
 builder.Services.AddSingleton(zoneStore);
-builder.Services.AddSingleton(new DnsServerOptions());
+builder.Services.AddSingleton(dnsOptions);
 builder.Services.AddHostedService<DnsServer>();
 
 using var host = builder.Build();
